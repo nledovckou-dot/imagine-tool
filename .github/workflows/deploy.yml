@@ -1,0 +1,87 @@
+name: Deploy to VPS
+
+on:
+  push:
+    branches: ["main"]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          REPO_URL: https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        with:
+          host: ${{ secrets.SSH_HOST }}
+          username: ${{ secrets.SSH_USER }}
+          key: ${{ secrets.SSH_KEY }}
+          port: ${{ secrets.SSH_PORT }}
+          command_timeout: 10m
+          envs: REPO_URL,OPENAI_API_KEY
+          script: |
+            set -e
+            APP_DIR=/opt/imagine-tool
+
+            # Clone or update repo
+            if [ ! -d "$APP_DIR" ]; then
+              sudo -n mkdir -p "$APP_DIR"
+              sudo -n chown $(whoami):$(whoami) "$APP_DIR"
+              cd "$APP_DIR"
+              git init -b main
+            else
+              cd "$APP_DIR"
+            fi
+            git remote set-url origin "$REPO_URL" 2>/dev/null || git remote add origin "$REPO_URL"
+            git fetch origin main
+            git reset --hard origin/main
+
+            # Setup .env
+            if [ ! -f "$APP_DIR/.env" ]; then
+              cat > "$APP_DIR/.env" <<ENVEOF
+            OPENAI_API_KEY=${OPENAI_API_KEY}
+            OPENAI_BASE_URL=https://openai-proxy.nledovskoy.workers.dev/v1
+            KLING_ACCESS_KEY=AAaCLeD3MDY3C9m3kJkbJTRdmdEdfTLQ
+            KLING_SECRET_KEY=yYRMayfatP4dyRMAhtTYHry3Jgyt4TtB
+            ENVEOF
+            fi
+            # Always update OpenAI key
+            sed -i '/^OPENAI_API_KEY=/d' "$APP_DIR/.env"
+            echo "OPENAI_API_KEY=${OPENAI_API_KEY}" >> "$APP_DIR/.env"
+
+            # Python venv
+            if [ ! -d "$APP_DIR/.venv" ]; then
+              python3 -m venv "$APP_DIR/.venv"
+            fi
+            "$APP_DIR/.venv/bin/pip" install -q -r "$APP_DIR/requirements.txt"
+
+            # Systemd service
+            cat <<'SVCEOF' | sudo -n tee /etc/systemd/system/imagine-tool.service
+            [Unit]
+            Description=Imagine Tool Web App
+            After=network.target
+
+            [Service]
+            Type=simple
+            User=root
+            WorkingDirectory=/opt/imagine-tool
+            EnvironmentFile=/opt/imagine-tool/.env
+            ExecStart=/opt/imagine-tool/.venv/bin/gunicorn --bind 0.0.0.0:8080 --timeout 600 --workers 2 --threads 4 app:app
+            Restart=always
+            RestartSec=5
+
+            [Install]
+            WantedBy=multi-user.target
+            SVCEOF
+
+            sudo -n systemctl daemon-reload
+            sudo -n systemctl enable imagine-tool
+            pgrep -af "imagine-tool" | grep -v grep | awk '{print $1}' | xargs -r sudo -n kill -9 2>/dev/null || true
+            sleep 1
+            sudo -n systemctl restart imagine-tool
+            sleep 3
+            echo "=== Imagine Tool status ==="
+            sudo -n systemctl status imagine-tool --no-pager | head -10
+            echo "=== Checking port 8080 ==="
+            curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/ || echo "not yet ready"
