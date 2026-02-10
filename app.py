@@ -29,6 +29,8 @@ _HEDRA_KEY = os.environ.get("HEDRA_API_KEY", "").strip()
 _HEDRA_BASE = os.environ.get("HEDRA_BASE_URL", "https://mercury.dev.dream-ai.com/api").strip().rstrip("/")
 _FAL_KEY = os.environ.get("FAL_KEY", "").strip()
 _FAL_BASE = "https://queue.fal.run"
+_YANDEX_API_KEY = os.environ.get("YANDEX_GPT_API_KEY", "").strip()
+_YANDEX_FOLDER = os.environ.get("YANDEX_FOLDER_ID", "").strip()
 _OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(_OUTPUT_DIR, exist_ok=True)
 
@@ -164,6 +166,167 @@ def gpt_creative_prompts(idea: str, ref_images: list[tuple[bytes, str]] | None =
         vid_prompt = parts[1].strip()
 
     return img_prompt, vid_prompt
+
+
+def yandex_gpt_creative_prompts(idea: str) -> tuple[str, str]:
+    """Fallback: use YandexGPT for creative brief if OpenAI is down."""
+    if not _YANDEX_API_KEY or not _YANDEX_FOLDER:
+        raise RuntimeError("YandexGPT not configured")
+
+    payload = {
+        "modelUri": f"gpt://{_YANDEX_FOLDER}/yandexgpt/latest",
+        "completionOptions": {"maxTokens": 2500, "temperature": 0.7},
+        "messages": [
+            {"role": "system", "text": (
+                "Ты — креативный директор. Клиент даёт идею, ты создаёшь 2 промпта.\n"
+                "ПРОМПТ 1 — КАРТИНКА: детальное описание ключевого кадра, 1000-1500 символов. "
+                "Композиция, свет, цвета, люди, эмоции, текстуры.\n"
+                "ПРОМПТ 2 — ВИДЕО: посекундное описание 8-секундного ролика, 1500-2500 символов. "
+                "Движение камеры, смена планов, действие, финал.\n"
+                "ФОРМАТ:\nКАРТИНКА: [промпт]\nВИДЕО: [промпт]"
+            )},
+            {"role": "user", "text": f"Идея: {idea}"},
+        ],
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        "https://llm.api.cloud.yandex.net/foundationModels/v1/completion",
+        data=body, method="POST",
+    )
+    req.add_header("Authorization", f"Api-Key {_YANDEX_API_KEY}")
+    req.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8")[:300] if e.fp else ""
+        raise RuntimeError(f"YandexGPT HTTP {e.code}: {err}") from e
+
+    text = result.get("result", {}).get("alternatives", [{}])[0].get("message", {}).get("text", "")
+    if not text:
+        raise RuntimeError(f"YandexGPT: empty response")
+
+    img_prompt = text
+    vid_prompt = text
+    if "КАРТИНКА:" in text and "ВИДЕО:" in text:
+        parts = text.split("ВИДЕО:")
+        img_prompt = parts[0].replace("КАРТИНКА:", "").strip()
+        vid_prompt = parts[1].strip()
+    return img_prompt, vid_prompt
+
+
+def fallback_prompts(idea: str) -> tuple[str, str]:
+    """Last resort: use raw idea with template enhancement."""
+    img_prompt = (
+        f"Премиальная рекламная фотография высочайшего качества. {idea}. "
+        "Кинематографичная композиция, профессиональный студийный свет, "
+        "глубина резкости, яркие насыщенные цвета, люди в кадре с эмоциями, "
+        "детализированные текстуры, 8k, hyperrealistic, editorial photography, "
+        "стиль Apple/Nike/Mercedes рекламы."
+    )
+    vid_prompt = (
+        f"8-секундный кинематографичный рекламный ролик премиум-класса. {idea}. "
+        "Секунды 0-2: общий план, плавный наезд камеры, устанавливаем сцену. "
+        "Секунды 2-4: средний план, герои в действии, динамика нарастает. "
+        "Секунды 4-6: крупные планы, детали, кульминация движения, slow motion. "
+        "Секунды 6-8: финальный кадр, логотип/слоган появляется. "
+        "Движение камеры: crane shot, dolly zoom, golden hour свет, "
+        "кинематографичная цветокоррекция, shallow depth of field, "
+        "частицы в воздухе, блики, драматические тени."
+    )
+    return img_prompt, vid_prompt
+
+
+# ── fal.ai Flux (image fallback) ──
+
+def generate_flux_image(prompt: str) -> str:
+    """Generate image via fal.ai Flux Pro."""
+    if not _FAL_KEY:
+        raise RuntimeError("FAL_KEY not configured")
+
+    payload = {
+        "prompt": prompt[:4000],
+        "image_size": "landscape_16_9",
+        "num_images": 1,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{_FAL_BASE}/fal-ai/flux-pro/v1.1",
+        data=body, method="POST",
+    )
+    req.add_header("Authorization", f"Key {_FAL_KEY}")
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8")[:500] if e.fp else ""
+        raise RuntimeError(f"Flux submit HTTP {e.code}: {err[:200]}") from e
+
+    request_id = result.get("request_id")
+    if not request_id:
+        # Synchronous response — check for images directly
+        images = result.get("images", [])
+        if images:
+            return _download_fal_image(images[0].get("url", ""))
+        raise RuntimeError(f"Flux: no request_id or images: {result}")
+
+    print(f"[flux] Submitted job: {request_id}", flush=True)
+
+    # Poll for completion (max 2 min)
+    status_url = f"{_FAL_BASE}/fal-ai/flux-pro/v1.1/requests/{request_id}/status"
+    result_url = f"{_FAL_BASE}/fal-ai/flux-pro/v1.1/requests/{request_id}"
+
+    deadline = time.time() + 120
+    while time.time() < deadline:
+        time.sleep(5)
+        poll_req = urllib.request.Request(status_url, method="GET")
+        poll_req.add_header("Authorization", f"Key {_FAL_KEY}")
+        try:
+            with urllib.request.urlopen(poll_req, timeout=30) as resp:
+                sr = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError:
+            continue
+        status = sr.get("status", "")
+        if status == "COMPLETED":
+            break
+        if status in ("FAILED", "CANCELLED"):
+            raise RuntimeError(f"Flux failed: {sr}")
+    else:
+        raise RuntimeError("Flux: таймаут (2 мин)")
+
+    res_req = urllib.request.Request(result_url, method="GET")
+    res_req.add_header("Authorization", f"Key {_FAL_KEY}")
+    with urllib.request.urlopen(res_req, timeout=30) as resp:
+        res = json.loads(resp.read().decode("utf-8"))
+
+    images = res.get("images", [])
+    if not images:
+        raise RuntimeError(f"Flux: no images in result: {res}")
+    return _download_fal_image(images[0].get("url", ""))
+
+
+def _download_fal_image(img_url: str) -> str:
+    """Download image from fal.ai URL."""
+    if not img_url:
+        raise RuntimeError("Flux: empty image URL")
+    with urllib.request.urlopen(img_url, timeout=60) as resp:
+        img_bytes = resp.read()
+    ext = ".png" if "png" in img_url else ".jpg"
+    fpath = os.path.join(_OUTPUT_DIR, f"flux_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}")
+    fd, tmp = tempfile.mkstemp(dir=_OUTPUT_DIR, suffix=ext)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(img_bytes)
+        os.replace(tmp, fpath)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return fpath
 
 
 # ── DALL-E ──
@@ -634,16 +797,57 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
         q.put(event)
 
     try:
-        # 1. GPT
-        emit("GPT создаёт креативный бриф...", step="gpt")
-        img_prompt, vid_prompt = gpt_creative_prompts(idea, ref_images if ref_images else None)
-        emit(f"Бриф готов", step="gpt_done", img_prompt=img_prompt, vid_prompt=vid_prompt)
+        # 1. Creative brief (GPT → YandexGPT → template fallback)
+        img_prompt = vid_prompt = ""
+        brief_source = ""
+        emit("Создаю креативный бриф...", step="gpt")
 
-        # 2. DALL-E
-        emit("Генерирую картинку (DALL-E 3 HD)...", step="dalle")
-        img_path = generate_dalle(img_prompt)
+        # Try OpenAI GPT
+        if _OPENAI_KEY:
+            try:
+                img_prompt, vid_prompt = gpt_creative_prompts(idea, ref_images if ref_images else None)
+                brief_source = "GPT"
+            except Exception as gpt_err:
+                emit(f"GPT: {str(gpt_err)[:100]}. Пробую YandexGPT...", step="gpt_fallback")
+        # Try YandexGPT
+        if not img_prompt and _YANDEX_API_KEY:
+            try:
+                img_prompt, vid_prompt = yandex_gpt_creative_prompts(idea)
+                brief_source = "YandexGPT"
+            except Exception as ya_err:
+                emit(f"YandexGPT: {str(ya_err)[:100]}. Использую шаблон...", step="gpt_fallback")
+        # Fallback to template
+        if not img_prompt:
+            img_prompt, vid_prompt = fallback_prompts(idea)
+            brief_source = "шаблон"
+
+        emit(f"Бриф готов ({brief_source})", step="gpt_done", img_prompt=img_prompt, vid_prompt=vid_prompt)
+
+        # 2. Image (DALL-E → Flux → template)
+        img_path = None
+        img_source = ""
+
+        # Try DALL-E
+        if _OPENAI_KEY:
+            try:
+                emit("Генерирую картинку (DALL-E 3 HD)...", step="dalle")
+                img_path = generate_dalle(img_prompt)
+                img_source = "DALL-E"
+            except Exception as dalle_err:
+                emit(f"DALL-E: {str(dalle_err)[:100]}. Пробую Flux...", step="dalle_fallback")
+        # Try fal.ai Flux
+        if not img_path and _FAL_KEY:
+            try:
+                emit("Генерирую картинку (Flux Pro)...", step="dalle")
+                img_path = generate_flux_image(img_prompt)
+                img_source = "Flux"
+            except Exception as flux_err:
+                emit(f"Flux: {str(flux_err)[:100]}", step="dalle_fallback")
+        if not img_path:
+            raise RuntimeError("Не удалось сгенерировать картинку ни через один провайдер")
+
         img_name = os.path.basename(img_path)
-        emit("Картинка готова!", step="dalle_done", image=f"/output/{img_name}")
+        emit(f"Картинка готова ({img_source})!", step="dalle_done", image=f"/output/{img_name}")
 
         # 3. Resize
         video_img = resize_for_video(img_path, 1280, 720)
@@ -738,8 +942,8 @@ def serve_output(filename):
 
 @app.route("/api/generate", methods=["POST"])
 def api_generate():
-    if not _OPENAI_KEY:
-        return jsonify({"error": "OPENAI_API_KEY not configured"}), 500
+    if not _OPENAI_KEY and not _FAL_KEY:
+        return jsonify({"error": "No API keys configured (need OPENAI_API_KEY or FAL_KEY)"}), 500
 
     idea = request.form.get("idea", "").strip()
     if not idea:
