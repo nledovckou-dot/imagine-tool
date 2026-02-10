@@ -505,17 +505,23 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
     if not _KLING_ACCESS or not _KLING_SECRET:
         raise RuntimeError("Kling API keys not configured")
 
-    # Kling has base64 size limits — compress to small JPEG
+    # Kling has strict base64 size limits — compress aggressively
     from PIL import Image
-    img = Image.open(image_path).convert("RGB")
-    # Resize to max 1280x720, quality 60 for smaller base64
-    img.thumbnail((1280, 720), Image.LANCZOS)
     import io
+    img = Image.open(image_path).convert("RGB")
+    img.thumbnail((960, 540), Image.LANCZOS)
     buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=60)
-    image_b64 = base64.b64encode(buf.getvalue()).decode()
+    img.save(buf, format="JPEG", quality=40)
+    raw = buf.getvalue()
+    # If still too large, compress more
+    if len(raw) > 500_000:
+        img.thumbnail((640, 360), Image.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, format="JPEG", quality=30)
+        raw = buf.getvalue()
+    image_b64 = base64.b64encode(raw).decode()
     mime = "image/jpeg"
-    print(f"[kling] Image for API: {img.size}, base64 len={len(image_b64)}", flush=True)
+    print(f"[kling] Image for API: {img.size}, jpeg={len(raw)} bytes, base64={len(image_b64)} chars", flush=True)
 
     # v2-master supports 5 or 10 sec
     if duration_sec not in (5, 10):
@@ -852,8 +858,17 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
         # 3. Resize
         video_img = resize_for_video(img_path, 1280, 720)
 
-        # 4. Video — ALL providers in parallel for comparison
-        emit("Запускаю генерацию видео (Kling + Sora + Veo 3 параллельно)...", step="video")
+        # 4. Video — available providers in parallel for comparison
+        providers_list = []
+        if _KLING_ACCESS and _KLING_SECRET:
+            providers_list.append("Kling")
+        if _HEDRA_KEY:
+            providers_list.append("Hedra")
+        if _FAL_KEY:
+            providers_list.append("Veo 3")
+        if _OPENAI_KEY:
+            providers_list.append("Sora")
+        emit(f"Запускаю видео ({' + '.join(providers_list)} параллельно)...", step="video")
 
         results: dict[str, dict] = {}  # provider → {"path": ..., "error": ...}
         lock = threading.Lock()
@@ -873,10 +888,14 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
         if _KLING_ACCESS and _KLING_SECRET:
             t = threading.Thread(target=run_provider, args=("Kling", generate_kling_video, (video_img, vid_prompt, 10)))
             threads.append(t)
-        t = threading.Thread(target=run_provider, args=("Sora", generate_sora_video, (video_img, vid_prompt, 8)))
-        threads.append(t)
+        if _HEDRA_KEY:
+            t = threading.Thread(target=run_provider, args=("Hedra", generate_hedra_video, (video_img, idea)))
+            threads.append(t)
         if _FAL_KEY:
             t = threading.Thread(target=run_provider, args=("Veo 3", generate_veo3_video, (video_img, vid_prompt)))
+            threads.append(t)
+        if _OPENAI_KEY:
+            t = threading.Thread(target=run_provider, args=("Sora", generate_sora_video, (video_img, vid_prompt, 8)))
             threads.append(t)
 
         for t in threads:
