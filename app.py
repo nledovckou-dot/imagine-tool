@@ -147,8 +147,13 @@ def gpt_creative_prompts(idea: str, ref_images: list[tuple[bytes, str]] | None =
     req = urllib.request.Request(f"{_OPENAI_BASE}/chat/completions", data=data, method="POST")
     for k, v in _openai_headers().items():
         req.add_header(k, v)
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        body = json.loads(resp.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        err = e.read().decode()[:500] if e.fp else ""
+        print(f"[GPT] HTTP {e.code}: {err}", flush=True)
+        raise RuntimeError(f"GPT HTTP {e.code}: {err[:200]}") from e
     text = body["choices"][0]["message"]["content"].strip()
 
     img_prompt = text
