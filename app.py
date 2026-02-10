@@ -442,22 +442,29 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
         # 3. Resize
         video_img = resize_for_video(img_path, 1280, 720)
 
-        # 4. Video (Sora → Kling fallback)
+        # 4. Video (Kling primary → Sora fallback)
         vid_path = None
         vid_label = ""
-        try:
-            emit("Генерирую видео (Sora 2, ~2-5 мин)...", step="video")
-            vid_path = generate_sora_video(video_img, vid_prompt, seconds=8)
-            vid_label = "Sora 2"
-        except Exception as sora_err:
-            emit(f"Sora не сработал: {str(sora_err)[:100]}. Пробую Kling...", step="video_fallback")
+        errors = []
+        # Try Kling first (more reliable)
+        if _KLING_ACCESS and _KLING_SECRET:
             try:
+                emit("Генерирую видео (Kling, ~1-3 мин)...", step="video")
                 vid_path = generate_kling_video(video_img, vid_prompt, duration_sec=10)
                 vid_label = "Kling"
             except Exception as kling_err:
-                raise RuntimeError(
-                    f"Оба провайдера не смогли:\nSora: {sora_err}\nKling: {kling_err}"
-                )
+                errors.append(f"Kling: {kling_err}")
+                emit(f"Kling: {str(kling_err)[:120]}. Пробую Sora...", step="video_fallback")
+        # Fallback to Sora
+        if not vid_path:
+            try:
+                emit("Генерирую видео (Sora 2)...", step="video")
+                vid_path = generate_sora_video(video_img, vid_prompt, seconds=8)
+                vid_label = "Sora 2"
+            except Exception as sora_err:
+                errors.append(f"Sora: {sora_err}")
+        if not vid_path:
+            raise RuntimeError("Видео не удалось:\n" + "\n".join(errors))
 
         vid_name = os.path.basename(vid_path)
         emit("Готово!", step="done", video=f"/output/{vid_name}", video_provider=vid_label)
