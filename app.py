@@ -335,15 +335,17 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
     if not _KLING_ACCESS or not _KLING_SECRET:
         raise RuntimeError("Kling API keys not configured")
 
-    with open(image_path, "rb") as f:
-        image_b64 = base64.b64encode(f.read()).decode()
-    ext = os.path.splitext(image_path)[1].lower().lstrip(".")
-    if ext in ("jpg", "jpeg"):
-        mime = "image/jpeg"
-    elif ext == "webp":
-        mime = "image/webp"
-    else:
-        mime = "image/png"
+    # Kling has base64 size limits — compress to small JPEG
+    from PIL import Image
+    img = Image.open(image_path).convert("RGB")
+    # Resize to max 1280x720, quality 60 for smaller base64
+    img.thumbnail((1280, 720), Image.LANCZOS)
+    import io
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=60)
+    image_b64 = base64.b64encode(buf.getvalue()).decode()
+    mime = "image/jpeg"
+    print(f"[kling] Image for API: {img.size}, base64 len={len(image_b64)}", flush=True)
 
     # v2-master supports 5 or 10 sec
     if duration_sec not in (5, 10):
