@@ -233,7 +233,7 @@ def generate_sora_video(image_path: str, prompt: str, seconds: int = 8) -> str:
     boundary = f"----SoraBound{int(time.time())}"
     fields = {
         "model": "sora-2",
-        "prompt": prompt[:2500],
+        "prompt": prompt,
         "size": "1280x720",
         "seconds": str(seconds),
     }
@@ -345,7 +345,9 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
     else:
         mime = "image/png"
 
-    duration_sec = 10 if duration_sec > 5 else 5
+    # v2-master supports 5 or 10 sec
+    if duration_sec not in (5, 10):
+        duration_sec = 10
     body_data = {
         "model_name": "kling-v2-master",
         "image": f"data:{mime};base64,{image_b64}",
