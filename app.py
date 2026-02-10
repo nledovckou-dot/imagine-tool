@@ -1,4 +1,5 @@
 """Imagine Tool — web app: text (+ ref photos) → GPT → DALL-E → Sora/Kling video."""
+from __future__ import annotations
 
 import base64
 import hashlib
@@ -12,6 +13,7 @@ import time
 import urllib.error
 import urllib.request
 import uuid
+from typing import List, Optional, Tuple
 
 from flask import Flask, Response, jsonify, request, send_from_directory
 
