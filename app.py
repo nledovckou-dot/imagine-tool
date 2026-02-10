@@ -572,29 +572,19 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
     if not _KLING_ACCESS or not _KLING_SECRET:
         raise RuntimeError("Kling API keys not configured")
 
-    # Compress image for Kling base64 upload
-    from PIL import Image
-    import io
-    img = Image.open(image_path).convert("RGB")
-    # Try progressively smaller sizes until base64 < 10MB
-    for max_w, max_h, q in [(960, 540, 50), (640, 360, 40), (480, 270, 30)]:
-        trial = img.copy()
-        trial.thumbnail((max_w, max_h), Image.LANCZOS)
-        buf = io.BytesIO()
-        trial.save(buf, format="JPEG", quality=q)
-        raw = buf.getvalue()
-        image_b64 = base64.b64encode(raw).decode()
-        print(f"[kling] Try {trial.size} q{q}: jpeg={len(raw)} bytes, b64={len(image_b64)} chars", flush=True)
-        if len(image_b64) < 10_000_000:  # 10MB limit
-            break
-    mime = "image/jpeg"
+    # Read raw file bytes and encode to base64 (no PIL re-compression)
+    with open(image_path, "rb") as f:
+        raw_bytes = f.read()
+    image_b64 = base64.b64encode(raw_bytes).decode()
+    print(f"[kling] Image: {image_path}, size={len(raw_bytes)} bytes, b64={len(image_b64)} chars", flush=True)
 
     # v2-master supports 5 or 10 sec
     if duration_sec not in (5, 10):
         duration_sec = 10
+    # Kling API accepts raw base64 or URL (NOT data URI with prefix)
     body_data = {
         "model_name": "kling-v2-master",
-        "image": f"data:{mime};base64,{image_b64}",
+        "image": image_b64,
         "prompt": prompt,
         "duration": str(duration_sec),
         "mode": "std",
