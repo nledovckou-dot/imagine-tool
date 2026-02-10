@@ -7,7 +7,7 @@
 <style>
 * { box-sizing: border-box; margin: 0; padding: 0; }
 body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #111; color: #eee; min-height: 100vh; display: flex; justify-content: center; padding: 20px; }
-.app { max-width: 700px; width: 100%; }
+.app { max-width: 900px; width: 100%; }
 h1 { font-size: 22px; margin-bottom: 20px; font-weight: 500; }
 .form-group { margin-bottom: 16px; }
 label { display: block; font-size: 13px; color: #888; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
@@ -26,11 +26,21 @@ button.go:disabled { opacity: 0.3; cursor: not-allowed; }
 .log-entry.active { border-left-color: #f0c040; }
 .log-entry.done { border-left-color: #4caf50; }
 .log-entry.error { border-left-color: #f44; color: #f88; }
+.log-entry.partial { border-left-color: #4caf50; color: #8f8; }
 .brief { margin-top: 16px; padding: 12px; background: #1a1a1a; border-radius: 8px; font-size: 13px; line-height: 1.5; color: #bbb; white-space: pre-wrap; }
 .brief b { color: #eee; }
 .result { margin-top: 24px; }
 .result img { width: 100%; border-radius: 8px; margin-bottom: 12px; }
-.result video { width: 100%; border-radius: 8px; background: #000; }
+.videos-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 16px; margin-top: 16px; }
+.video-card { background: #1a1a1a; border-radius: 8px; overflow: hidden; }
+.video-card video { width: 100%; display: block; }
+.video-card .video-label { padding: 8px 12px; font-size: 13px; color: #aaa; display: flex; justify-content: space-between; align-items: center; }
+.video-card .video-label span { font-weight: 600; color: #eee; }
+.video-card .video-label a { color: #8af; text-decoration: none; font-size: 12px; }
+.video-card .video-label a:hover { text-decoration: underline; }
+.download-row { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+.download-row a { padding: 8px 16px; background: #222; color: #eee; text-decoration: none; border-radius: 6px; font-size: 13px; transition: background 0.2s; }
+.download-row a:hover { background: #333; }
 .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #555; border-top-color: #f0c040; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 8px; vertical-align: middle; }
 @keyframes spin { to { transform: rotate(360deg); } }
 .history { margin-top: 40px; border-top: 1px solid #222; padding-top: 20px; }
@@ -40,9 +50,6 @@ button.go:disabled { opacity: 0.3; cursor: not-allowed; }
 .history-item img { width: 60px; height: 60px; border-radius: 6px; object-fit: cover; flex-shrink: 0; }
 .history-item .info { font-size: 13px; color: #aaa; overflow: hidden; }
 .history-item .info .title { color: #eee; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.download-row { display: flex; gap: 8px; margin-top: 12px; }
-.download-row a { padding: 8px 16px; background: #222; color: #eee; text-decoration: none; border-radius: 6px; font-size: 13px; transition: background 0.2s; }
-.download-row a:hover { background: #333; }
 </style>
 </head>
 <body>
@@ -62,7 +69,7 @@ button.go:disabled { opacity: 0.3; cursor: not-allowed; }
     <input type="file" id="fileInput" accept="image/*" multiple>
   </div>
 
-  <button class="go" id="goBtn" onclick="startGeneration()">Создать картинку + видео</button>
+  <button class="go" id="goBtn" onclick="startGeneration()">Создать картинку + 3 видео</button>
 
   <div class="log" id="log"></div>
   <div id="briefBox"></div>
@@ -140,12 +147,11 @@ async function startGeneration() {
 
     const es = new EventSource('/api/stream/' + jobId);
     let imageUrl = null;
-    let videoUrl = null;
 
     es.onmessage = (e) => {
       const ev = JSON.parse(e.data);
 
-      // Remove previous active
+      // Remove previous active spinners (but keep partial results)
       document.querySelectorAll('.log-entry.active').forEach(el => {
         el.classList.remove('active');
         el.querySelector('.spinner')?.remove();
@@ -158,17 +164,52 @@ async function startGeneration() {
         return;
       }
 
+      if (ev.step === 'video_partial') {
+        addLog(ev.msg, 'partial');
+        return;
+      }
+
+      if (ev.step === 'video_error') {
+        addLog(ev.msg, 'error');
+        return;
+      }
+
       if (ev.step === 'done') {
-        addLog('Готово!', 'done');
-        videoUrl = ev.video;
-        if (videoUrl) {
-          const r = document.getElementById('result');
-          r.innerHTML += `<video controls autoplay loop><source src="${videoUrl}" type="video/mp4"></video>`;
-          r.innerHTML += `<div class="download-row">
-            ${imageUrl ? `<a href="${imageUrl}" download>Скачать картинку</a>` : ''}
-            <a href="${videoUrl}" download>Скачать видео</a>
-          </div>`;
+        addLog(ev.msg || 'Готово!', 'done');
+        const r = document.getElementById('result');
+
+        // Show all videos in a grid
+        if (ev.videos && ev.videos.length > 0) {
+          let grid = '<div class="videos-grid">';
+          for (const v of ev.videos) {
+            grid += `<div class="video-card">
+              <video controls autoplay loop muted playsinline><source src="${v.url}" type="video/mp4"></video>
+              <div class="video-label"><span>${esc(v.provider)}</span><a href="${v.url}" download>Скачать</a></div>
+            </div>`;
+          }
+          grid += '</div>';
+          r.innerHTML += grid;
+        } else if (ev.video) {
+          r.innerHTML += `<video controls autoplay loop><source src="${ev.video}" type="video/mp4"></video>`;
         }
+
+        // Download row
+        let dl = '<div class="download-row">';
+        if (imageUrl) dl += `<a href="${imageUrl}" download>Скачать картинку</a>`;
+        if (ev.videos) {
+          for (const v of ev.videos) {
+            dl += `<a href="${v.url}" download>Скачать ${esc(v.provider)}</a>`;
+          }
+        }
+        dl += '</div>';
+        r.innerHTML += dl;
+
+        if (ev.errors && ev.errors.length > 0) {
+          for (const err of ev.errors) {
+            addLog(err, 'error');
+          }
+        }
+
         saveHistory();
         es.close();
         btn.disabled = false;
@@ -208,7 +249,6 @@ function esc(s) {
 }
 
 function saveHistory() {
-  // History is saved server-side, just reload it
   loadHistory();
 }
 
@@ -239,21 +279,25 @@ function renderHistory() {
   list.querySelectorAll('.history-item').forEach(el => {
     el.addEventListener('click', () => {
       const h = history[el.dataset.idx];
-      showHistoryItem(h.image, h.video);
+      showHistoryItem(h.image, h.videos || (h.video ? [{provider: h.provider, url: h.video}] : []));
     });
   });
 }
 
-function showHistoryItem(img, vid) {
+function showHistoryItem(img, videos) {
   const r = document.getElementById('result');
   r.innerHTML = '';
   if (img) r.innerHTML += `<img src="${img}">`;
-  if (vid) r.innerHTML += `<video controls autoplay loop><source src="${vid}" type="video/mp4"></video>`;
-  if (img || vid) {
-    r.innerHTML += `<div class="download-row">
-      ${img ? `<a href="${img}" download>Скачать картинку</a>` : ''}
-      ${vid ? `<a href="${vid}" download>Скачать видео</a>` : ''}
-    </div>`;
+  if (videos && videos.length > 0) {
+    let grid = '<div class="videos-grid">';
+    for (const v of videos) {
+      grid += `<div class="video-card">
+        <video controls autoplay loop muted playsinline><source src="${v.url}" type="video/mp4"></video>
+        <div class="video-label"><span>${esc(v.provider)}</span><a href="${v.url}" download>Скачать</a></div>
+      </div>`;
+    }
+    grid += '</div>';
+    r.innerHTML += grid;
   }
   r.scrollIntoView({ behavior: 'smooth' });
 }

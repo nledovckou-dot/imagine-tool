@@ -27,6 +27,8 @@ _KLING_ACCESS = os.environ.get("KLING_ACCESS_KEY", "").strip()
 _KLING_SECRET = os.environ.get("KLING_SECRET_KEY", "").strip()
 _HEDRA_KEY = os.environ.get("HEDRA_API_KEY", "").strip()
 _HEDRA_BASE = os.environ.get("HEDRA_BASE_URL", "https://mercury.dev.dream-ai.com/api").strip().rstrip("/")
+_FAL_KEY = os.environ.get("FAL_KEY", "").strip()
+_FAL_BASE = "https://queue.fal.run"
 _OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(_OUTPUT_DIR, exist_ok=True)
 
@@ -523,6 +525,99 @@ def generate_hedra_video(image_path: str, text: str) -> str:
     raise RuntimeError("Hedra: таймаут (3 мин)")
 
 
+# ── Veo 3 via FAL.ai (image-to-video) ──
+
+def generate_veo3_video(image_path: str, prompt: str) -> str:
+    """Generate video via Google Veo 3 through FAL.ai queue API."""
+    if not _FAL_KEY:
+        raise RuntimeError("FAL_KEY not configured")
+
+    # Read image as base64 data URL
+    from PIL import Image
+    import io
+    img = Image.open(image_path).convert("RGB")
+    img.thumbnail((1280, 720), Image.LANCZOS)
+    buf = io.BytesIO()
+    img.save(buf, format="JPEG", quality=85)
+    image_b64 = base64.b64encode(buf.getvalue()).decode()
+    data_url = f"data:image/jpeg;base64,{image_b64}"
+
+    # Submit to queue
+    payload = {
+        "image_url": data_url,
+        "prompt": prompt,
+    }
+    body = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        f"{_FAL_BASE}/fal-ai/veo3.1/image-to-video",
+        data=body, method="POST",
+    )
+    req.add_header("Authorization", f"Key {_FAL_KEY}")
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8")[:500] if e.fp else ""
+        raise RuntimeError(f"Veo3 submit HTTP {e.code}: {err[:200]}") from e
+
+    request_id = result.get("request_id")
+    if not request_id:
+        raise RuntimeError(f"Veo3: no request_id: {result}")
+    print(f"[veo3] Submitted job: {request_id}", flush=True)
+
+    # Poll for completion (max 5 min — Veo 3 can be slow)
+    status_url = f"{_FAL_BASE}/fal-ai/veo3.1/image-to-video/requests/{request_id}/status"
+    result_url = f"{_FAL_BASE}/fal-ai/veo3.1/image-to-video/requests/{request_id}"
+
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        time.sleep(10)
+        poll_req = urllib.request.Request(status_url, method="GET")
+        poll_req.add_header("Authorization", f"Key {_FAL_KEY}")
+        try:
+            with urllib.request.urlopen(poll_req, timeout=30) as resp:
+                sr = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError:
+            continue
+        status = sr.get("status", "")
+        if status == "COMPLETED":
+            break
+        if status in ("FAILED", "CANCELLED"):
+            raise RuntimeError(f"Veo3 failed: {sr}")
+        print(f"[veo3] Status: {status}, queue pos: {sr.get('queue_position', '?')}", flush=True)
+    else:
+        raise RuntimeError("Veo3: таймаут (5 мин)")
+
+    # Fetch result
+    res_req = urllib.request.Request(result_url, method="GET")
+    res_req.add_header("Authorization", f"Key {_FAL_KEY}")
+    with urllib.request.urlopen(res_req, timeout=30) as resp:
+        res = json.loads(resp.read().decode("utf-8"))
+
+    video_url = res.get("video", {}).get("url", "")
+    if not video_url:
+        raise RuntimeError(f"Veo3: no video URL in result: {res}")
+
+    # Download video
+    with urllib.request.urlopen(video_url, timeout=120) as resp:
+        vbytes = resp.read()
+    fpath = os.path.join(_OUTPUT_DIR, f"veo3_{request_id[:12]}.mp4")
+    fd, tmp = tempfile.mkstemp(dir=_OUTPUT_DIR, suffix=".mp4")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(vbytes)
+        os.replace(tmp, fpath)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return fpath
+
+
 # ── Background job ──
 
 def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
@@ -548,51 +643,72 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
         # 3. Resize
         video_img = resize_for_video(img_path, 1280, 720)
 
-        # 4. Video (Kling primary → Sora fallback)
-        vid_path = None
-        vid_label = ""
-        errors = []
-        # Try Kling first (more reliable)
-        if _KLING_ACCESS and _KLING_SECRET:
-            try:
-                emit("Генерирую видео (Kling, ~1-3 мин)...", step="video")
-                vid_path = generate_kling_video(video_img, vid_prompt, duration_sec=10)
-                vid_label = "Kling"
-            except Exception as kling_err:
-                errors.append(f"Kling: {kling_err}")
-                emit(f"Kling: {str(kling_err)[:120]}. Пробую Sora...", step="video_fallback")
-        # Fallback to Sora
-        if not vid_path:
-            try:
-                emit("Генерирую видео (Sora 2)...", step="video")
-                vid_path = generate_sora_video(video_img, vid_prompt, seconds=8)
-                vid_label = "Sora 2"
-            except Exception as sora_err:
-                errors.append(f"Sora: {sora_err}")
-                emit(f"Sora: {str(sora_err)[:120]}. Пробую Hedra...", step="video_fallback")
-        # Fallback to Hedra (animated portrait + TTS)
-        if not vid_path and _HEDRA_KEY:
-            try:
-                emit("Генерирую видео (Hedra)...", step="video")
-                vid_path = generate_hedra_video(video_img, idea)
-                vid_label = "Hedra"
-            except Exception as hedra_err:
-                errors.append(f"Hedra: {hedra_err}")
-        if not vid_path:
-            raise RuntimeError("Видео не удалось:\n" + "\n".join(errors))
+        # 4. Video — ALL providers in parallel for comparison
+        emit("Запускаю генерацию видео (Kling + Sora + Veo 3 параллельно)...", step="video")
 
-        vid_name = os.path.basename(vid_path)
-        emit("Готово!", step="done", video=f"/output/{vid_name}", video_provider=vid_label)
+        results: dict[str, dict] = {}  # provider → {"path": ..., "error": ...}
+        lock = threading.Lock()
+
+        def run_provider(name: str, fn, args):
+            try:
+                path = fn(*args)
+                with lock:
+                    results[name] = {"path": path}
+                emit(f"{name}: готово!", step="video_partial")
+            except Exception as e:
+                with lock:
+                    results[name] = {"error": str(e)}
+                emit(f"{name}: {str(e)[:120]}", step="video_error")
+
+        threads = []
+        if _KLING_ACCESS and _KLING_SECRET:
+            t = threading.Thread(target=run_provider, args=("Kling", generate_kling_video, (video_img, vid_prompt, 10)))
+            threads.append(t)
+        t = threading.Thread(target=run_provider, args=("Sora", generate_sora_video, (video_img, vid_prompt, 8)))
+        threads.append(t)
+        if _FAL_KEY:
+            t = threading.Thread(target=run_provider, args=("Veo 3", generate_veo3_video, (video_img, vid_prompt)))
+            threads.append(t)
+
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=360)  # 6 min max per thread
+
+        # Collect successful videos
+        videos = []
+        errors = []
+        for name, res in results.items():
+            if "path" in res:
+                vid_name = os.path.basename(res["path"])
+                videos.append({"provider": name, "url": f"/output/{vid_name}"})
+            else:
+                errors.append(f"{name}: {res.get('error', 'unknown')}")
+
+        if not videos:
+            raise RuntimeError("Ни одно видео не удалось:\n" + "\n".join(errors))
+
+        # Send all videos for comparison
+        providers_str = ", ".join(v["provider"] for v in videos)
+        emit(
+            f"Готово! Видео: {providers_str}",
+            step="done",
+            videos=videos,
+            video=videos[0]["url"],  # backward compat
+            video_provider=providers_str,
+            errors=errors if errors else None,
+        )
         job["status"] = "done"
 
-        # Save to shared history
+        # Save to shared history (first successful video as primary)
         _save_history_entry({
             "idea": idea,
             "img_prompt": img_prompt,
             "vid_prompt": vid_prompt,
             "image": f"/output/{img_name}",
-            "video": f"/output/{vid_name}",
-            "provider": vid_label,
+            "video": videos[0]["url"],
+            "videos": videos,
+            "provider": providers_str,
             "ts": int(time.time() * 1000),
         })
 
