@@ -25,6 +25,8 @@ _OPENAI_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 _OPENAI_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").strip().rstrip("/")
 _KLING_ACCESS = os.environ.get("KLING_ACCESS_KEY", "").strip()
 _KLING_SECRET = os.environ.get("KLING_SECRET_KEY", "").strip()
+_HEDRA_KEY = os.environ.get("HEDRA_API_KEY", "").strip()
+_HEDRA_BASE = os.environ.get("HEDRA_BASE_URL", "https://mercury.dev.dream-ai.com/api").strip().rstrip("/")
 _OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(_OUTPUT_DIR, exist_ok=True)
 
@@ -417,6 +419,106 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
     raise RuntimeError("Kling: таймаут (3 мин)")
 
 
+# ── Hedra (fallback — animated portrait with TTS) ──
+
+def _hedra_json(url: str, method: str = "GET", headers: Optional[dict] = None,
+                body: Optional[bytes] = None, timeout: int = 60) -> dict:
+    req = urllib.request.Request(url, method=method, headers=headers or {}, data=body)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8")[:300] if e.fp else ""
+        raise RuntimeError(f"Hedra HTTP {e.code}: {err}") from e
+
+
+def generate_hedra_video(image_path: str, text: str) -> str:
+    """Animate image as talking portrait via Hedra + TTS."""
+    if not _HEDRA_KEY:
+        raise RuntimeError("HEDRA_API_KEY not configured")
+
+    # 1. Upload image as portrait
+    boundary = f"----HedraUp{int(time.time())}"
+    fname = os.path.basename(image_path)
+    ct = "image/jpeg" if fname.endswith(".jpg") else "image/png"
+    with open(image_path, "rb") as f:
+        img_bytes = f.read()
+    parts = [
+        f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
+        f"filename=\"{fname}\"\r\nContent-Type: {ct}\r\n\r\n".encode(),
+        img_bytes,
+        f"\r\n--{boundary}--\r\n".encode(),
+    ]
+    body = b"".join(parts)
+    upload_resp = _hedra_json(
+        f"{_HEDRA_BASE}/v1/portrait?aspect_ratio=16:9",
+        method="POST",
+        headers={
+            "X-API-KEY": _HEDRA_KEY,
+            "Content-Type": f"multipart/form-data; boundary={boundary}",
+        },
+        body=body,
+    )
+    portrait_url = upload_resp.get("url")
+    if not portrait_url:
+        raise RuntimeError(f"Hedra upload failed: {upload_resp}")
+
+    # 2. Create character video with TTS
+    # Keep text short for natural speech (max ~200 chars)
+    short_text = text[:200].rsplit(" ", 1)[0] if len(text) > 200 else text
+    payload = {
+        "audioSource": "tts",
+        "text": short_text,
+        "avatarImage": portrait_url,
+        "aspectRatio": "16:9",
+    }
+    gen_resp = _hedra_json(
+        f"{_HEDRA_BASE}/v1/characters",
+        method="POST",
+        headers={
+            "X-API-KEY": _HEDRA_KEY,
+            "Content-Type": "application/json",
+        },
+        body=json.dumps(payload).encode("utf-8"),
+    )
+    job_id = gen_resp.get("jobId") or gen_resp.get("project_id") or gen_resp.get("id")
+    if not job_id:
+        raise RuntimeError(f"Hedra generate failed: {gen_resp}")
+
+    # 3. Poll for completion (max 3 min)
+    deadline = time.time() + 180
+    while time.time() < deadline:
+        time.sleep(8)
+        status = _hedra_json(
+            f"{_HEDRA_BASE}/v1/projects/{job_id}",
+            headers={"X-API-KEY": _HEDRA_KEY},
+        )
+        state = status.get("status") or status.get("stage") or "unknown"
+        if state in ("Completed", "completed", "done", "success"):
+            video_url = status.get("videoUrl") or status.get("video_url") or status.get("url")
+            if not video_url:
+                raise RuntimeError("Hedra: completed but no video URL")
+            # Download
+            with urllib.request.urlopen(video_url, timeout=120) as resp:
+                vbytes = resp.read()
+            fpath = os.path.join(_OUTPUT_DIR, f"hedra_{job_id}.mp4")
+            fd, tmp = tempfile.mkstemp(dir=_OUTPUT_DIR, suffix=".mp4")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(vbytes)
+                os.replace(tmp, fpath)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            return fpath
+        if state in ("Failed", "failed", "error"):
+            raise RuntimeError(f"Hedra failed: {status.get('errorMessage') or status}")
+    raise RuntimeError("Hedra: таймаут (3 мин)")
+
+
 # ── Background job ──
 
 def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
@@ -463,6 +565,15 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
                 vid_label = "Sora 2"
             except Exception as sora_err:
                 errors.append(f"Sora: {sora_err}")
+                emit(f"Sora: {str(sora_err)[:120]}. Пробую Hedra...", step="video_fallback")
+        # Fallback to Hedra (animated portrait + TTS)
+        if not vid_path and _HEDRA_KEY:
+            try:
+                emit("Генерирую видео (Hedra)...", step="video")
+                vid_path = generate_hedra_video(video_img, idea)
+                vid_label = "Hedra"
+            except Exception as hedra_err:
+                errors.append(f"Hedra: {hedra_err}")
         if not vid_path:
             raise RuntimeError("Видео не удалось:\n" + "\n".join(errors))
 
