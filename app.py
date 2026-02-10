@@ -31,6 +31,35 @@ os.makedirs(_OUTPUT_DIR, exist_ok=True)
 # ── Job tracking ──
 
 _jobs: dict[str, dict] = {}  # job_id → {status, progress_queue, result, ...}
+_HISTORY_FILE = os.path.join(os.path.dirname(__file__), "output", "history.json")
+_history_lock = threading.Lock()
+
+
+def _load_history() -> list:
+    try:
+        with open(_HISTORY_FILE, "r") as f:
+            return json.loads(f.read())
+    except (FileNotFoundError, json.JSONDecodeError):
+        return []
+
+
+def _save_history_entry(entry: dict):
+    with _history_lock:
+        history = _load_history()
+        history.insert(0, entry)
+        if len(history) > 100:
+            history = history[:100]
+        fd, tmp = tempfile.mkstemp(dir=_OUTPUT_DIR, suffix=".json")
+        try:
+            with os.fdopen(fd, "w") as f:
+                json.dump(history, f, ensure_ascii=False)
+            os.replace(tmp, _HISTORY_FILE)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
+            raise
 
 
 def _openai_headers() -> dict[str, str]:
@@ -434,6 +463,17 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
         emit("Готово!", step="done", video=f"/output/{vid_name}", video_provider=vid_label)
         job["status"] = "done"
 
+        # Save to shared history
+        _save_history_entry({
+            "idea": idea,
+            "img_prompt": img_prompt,
+            "vid_prompt": vid_prompt,
+            "image": f"/output/{img_name}",
+            "video": f"/output/{vid_name}",
+            "provider": vid_label,
+            "ts": int(time.time() * 1000),
+        })
+
     except Exception as exc:
         emit(f"Ошибка: {exc}", step="error")
         job["status"] = "error"
@@ -504,6 +544,11 @@ def api_stream(job_id):
 
     return Response(generate(), mimetype="text/event-stream",
                     headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"})
+
+
+@app.route("/api/history")
+def api_history():
+    return jsonify(_load_history())
 
 
 if __name__ == "__main__":

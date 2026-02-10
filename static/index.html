@@ -77,7 +77,7 @@ button.go:disabled { opacity: 0.3; cursor: not-allowed; }
 <script>
 const photoFiles = [];
 const MAX_PHOTOS = 3;
-let history = JSON.parse(localStorage.getItem('imagine_history') || '[]');
+let history = [];
 
 const fileInput = document.getElementById('fileInput');
 const photosArea = document.getElementById('photosArea');
@@ -169,7 +169,7 @@ async function startGeneration() {
             <a href="${videoUrl}" download>Скачать видео</a>
           </div>`;
         }
-        saveHistory(idea, imageUrl, videoUrl);
+        saveHistory();
         es.close();
         btn.disabled = false;
         return;
@@ -207,26 +207,41 @@ function esc(s) {
   return d.innerHTML;
 }
 
-function saveHistory(idea, img, vid) {
-  history.unshift({ idea, img, vid, ts: Date.now() });
-  if (history.length > 20) history = history.slice(0, 20);
-  localStorage.setItem('imagine_history', JSON.stringify(history));
+function saveHistory() {
+  // History is saved server-side, just reload it
+  loadHistory();
+}
+
+async function loadHistory() {
+  try {
+    const resp = await fetch('/api/history');
+    history = await resp.json();
+  } catch (e) {
+    history = [];
+  }
   renderHistory();
 }
 
 function renderHistory() {
-  if (!history.length) return;
-  document.getElementById('historySection').style.display = '';
+  const section = document.getElementById('historySection');
   const list = document.getElementById('historyList');
-  list.innerHTML = history.map(h => `
-    <div class="history-item" onclick="showHistoryItem('${esc(h.img || '')}', '${esc(h.vid || '')}')">
-      ${h.img ? `<img src="${h.img}">` : ''}
+  if (!history.length) { section.style.display = 'none'; return; }
+  section.style.display = '';
+  list.innerHTML = history.map((h, i) => `
+    <div class="history-item" data-idx="${i}">
+      ${h.image ? `<img src="${h.image}">` : ''}
       <div class="info">
         <div class="title">${esc(h.idea)}</div>
-        <div>${new Date(h.ts).toLocaleString('ru')}</div>
+        <div>${h.provider || ''} &middot; ${new Date(h.ts).toLocaleString('ru')}</div>
       </div>
     </div>
   `).join('');
+  list.querySelectorAll('.history-item').forEach(el => {
+    el.addEventListener('click', () => {
+      const h = history[el.dataset.idx];
+      showHistoryItem(h.image, h.video);
+    });
+  });
 }
 
 function showHistoryItem(img, vid) {
@@ -243,7 +258,7 @@ function showHistoryItem(img, vid) {
   r.scrollIntoView({ behavior: 'smooth' });
 }
 
-renderHistory();
+loadHistory();
 </script>
 </body>
 </html>
