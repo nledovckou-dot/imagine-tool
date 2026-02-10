@@ -265,9 +265,9 @@ def generate_sora_video(image_path: str, prompt: str, seconds: int = 8) -> str:
     if not video_id:
         raise RuntimeError(f"Sora: no video ID: {result}")
 
-    deadline = time.time() + 600
+    deadline = time.time() + 120  # 2 min max — fallback to Kling if slow
     while time.time() < deadline:
-        time.sleep(15)
+        time.sleep(10)
         poll_req = urllib.request.Request(f"{_OPENAI_BASE}/videos/{video_id}", method="GET")
         poll_req.add_header("Authorization", f"Bearer {_OPENAI_KEY}")
         poll_req.add_header("User-Agent", "ImagineTool/1.0")
@@ -284,7 +284,7 @@ def generate_sora_video(image_path: str, prompt: str, seconds: int = 8) -> str:
             err_msg = pr.get("error", {}).get("message", str(pr))
             raise RuntimeError(f"Sora failed: {err_msg}")
     else:
-        raise RuntimeError("Sora: timeout (10 min)")
+        raise RuntimeError("Sora: слишком долго, переключаюсь на Kling")
 
     dl_req = urllib.request.Request(f"{_OPENAI_BASE}/videos/{video_id}/content", method="GET")
     dl_req.add_header("Authorization", f"Bearer {_OPENAI_KEY}")
@@ -376,9 +376,9 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
     if not task_id:
         raise RuntimeError(f"Kling: no task_id: {result}")
 
-    deadline = time.time() + 300
+    deadline = time.time() + 180  # 3 min for Kling
     while time.time() < deadline:
-        time.sleep(10)
+        time.sleep(8)
         token = _kling_jwt()
         poll_req = urllib.request.Request(
             f"https://api.klingai.com/v1/videos/image2video/{task_id}",
@@ -414,7 +414,7 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
             return fpath
         if ts == "failed":
             raise RuntimeError(f"Kling failed: {sd.get('task_status_msg', 'unknown')}")
-    raise RuntimeError("Kling: timeout (5 min)")
+    raise RuntimeError("Kling: таймаут (3 мин)")
 
 
 # ── Background job ──
