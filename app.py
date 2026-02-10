@@ -29,6 +29,9 @@ _HEDRA_KEY = os.environ.get("HEDRA_API_KEY", "").strip()
 _HEDRA_BASE = os.environ.get("HEDRA_BASE_URL", "https://mercury.dev.dream-ai.com/api").strip().rstrip("/")
 _FAL_KEY = os.environ.get("FAL_KEY", "").strip()
 _FAL_BASE = "https://queue.fal.run"
+_GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
+_GEMINI_BASE = os.environ.get("GEMINI_BASE_URL", "").strip().rstrip("/")
+_GEMINI_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.0-flash-exp")
 _YANDEX_API_KEY = os.environ.get("YANDEX_GPT_API_KEY", "").strip()
 _YANDEX_FOLDER = os.environ.get("YANDEX_FOLDER_ID", "").strip()
 _OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
@@ -235,6 +238,70 @@ def fallback_prompts(idea: str) -> tuple[str, str]:
         "частицы в воздухе, блики, драматические тени."
     )
     return img_prompt, vid_prompt
+
+
+# ── Gemini image generation (works from Russia via proxy) ──
+
+def generate_gemini_image(prompt: str) -> str:
+    """Generate image via Google Gemini (needs GEMINI_BASE_URL proxy from Russia)."""
+    if not _GEMINI_KEY:
+        raise RuntimeError("GEMINI_API_KEY not configured")
+    if not _GEMINI_BASE:
+        raise RuntimeError("GEMINI_BASE_URL not configured")
+
+    url = f"{_GEMINI_BASE}/v1beta/models/{_GEMINI_MODEL}:generateContent"
+    headers = {
+        "x-goog-api-key": _GEMINI_KEY,
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]},
+    }
+    data = json.dumps(payload).encode("utf-8")
+
+    last_exc = None
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            candidates = body.get("candidates") or []
+            if not candidates:
+                raise RuntimeError("Gemini: no candidates")
+            parts = candidates[0].get("content", {}).get("parts", [])
+            for part in parts:
+                inline = part.get("inlineData")
+                if inline and inline.get("data"):
+                    img_bytes = base64.b64decode(inline["data"])
+                    mime = inline.get("mimeType", "image/png")
+                    ext = ".jpg" if "jpeg" in mime else ".png"
+                    fpath = os.path.join(_OUTPUT_DIR, f"gemini_{int(time.time())}_{uuid.uuid4().hex[:6]}{ext}")
+                    fd, tmp = tempfile.mkstemp(dir=_OUTPUT_DIR, suffix=ext)
+                    try:
+                        with os.fdopen(fd, "wb") as f:
+                            f.write(img_bytes)
+                        os.replace(tmp, fpath)
+                    except BaseException:
+                        try:
+                            os.unlink(tmp)
+                        except OSError:
+                            pass
+                        raise
+                    return fpath
+            raise RuntimeError("Gemini: no image in response")
+        except urllib.error.HTTPError as e:
+            err = e.read().decode("utf-8")[:300] if e.fp else ""
+            last_exc = RuntimeError(f"Gemini HTTP {e.code}: {err}")
+            if e.code in (429, 500, 502, 503):
+                time.sleep((2 ** attempt) * 2)
+                continue
+            raise last_exc from e
+        except (TimeoutError, OSError) as e:
+            last_exc = RuntimeError(str(e))
+            time.sleep((2 ** attempt) * 2)
+            continue
+    raise last_exc or RuntimeError("Gemini: all retries failed")
 
 
 # ── fal.ai Flux (image fallback) ──
@@ -505,23 +572,22 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
     if not _KLING_ACCESS or not _KLING_SECRET:
         raise RuntimeError("Kling API keys not configured")
 
-    # Kling has strict base64 size limits — compress aggressively
+    # Compress image for Kling base64 upload
     from PIL import Image
     import io
     img = Image.open(image_path).convert("RGB")
-    img.thumbnail((960, 540), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=40)
-    raw = buf.getvalue()
-    # If still too large, compress more
-    if len(raw) > 500_000:
-        img.thumbnail((640, 360), Image.LANCZOS)
+    # Try progressively smaller sizes until base64 < 10MB
+    for max_w, max_h, q in [(960, 540, 50), (640, 360, 40), (480, 270, 30)]:
+        trial = img.copy()
+        trial.thumbnail((max_w, max_h), Image.LANCZOS)
         buf = io.BytesIO()
-        img.save(buf, format="JPEG", quality=30)
+        trial.save(buf, format="JPEG", quality=q)
         raw = buf.getvalue()
-    image_b64 = base64.b64encode(raw).decode()
+        image_b64 = base64.b64encode(raw).decode()
+        print(f"[kling] Try {trial.size} q{q}: jpeg={len(raw)} bytes, b64={len(image_b64)} chars", flush=True)
+        if len(image_b64) < 10_000_000:  # 10MB limit
+            break
     mime = "image/jpeg"
-    print(f"[kling] Image for API: {img.size}, jpeg={len(raw)} bytes, base64={len(image_b64)} chars", flush=True)
 
     # v2-master supports 5 or 10 sec
     if duration_sec not in (5, 10):
@@ -840,7 +906,15 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
                 img_path = generate_dalle(img_prompt)
                 img_source = "DALL-E"
             except Exception as dalle_err:
-                emit(f"DALL-E: {str(dalle_err)[:100]}. Пробую Flux...", step="dalle_fallback")
+                emit(f"DALL-E: {str(dalle_err)[:100]}. Пробую Gemini...", step="dalle_fallback")
+        # Try Gemini
+        if not img_path and _GEMINI_KEY and _GEMINI_BASE:
+            try:
+                emit("Генерирую картинку (Gemini)...", step="dalle")
+                img_path = generate_gemini_image(img_prompt)
+                img_source = "Gemini"
+            except Exception as gemini_err:
+                emit(f"Gemini: {str(gemini_err)[:100]}. Пробую Flux...", step="dalle_fallback")
         # Try fal.ai Flux
         if not img_path and _FAL_KEY:
             try:
