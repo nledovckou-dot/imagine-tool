@@ -1,0 +1,249 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Imagine Tool</title>
+<style>
+* { box-sizing: border-box; margin: 0; padding: 0; }
+body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #111; color: #eee; min-height: 100vh; display: flex; justify-content: center; padding: 20px; }
+.app { max-width: 700px; width: 100%; }
+h1 { font-size: 22px; margin-bottom: 20px; font-weight: 500; }
+.form-group { margin-bottom: 16px; }
+label { display: block; font-size: 13px; color: #888; margin-bottom: 6px; text-transform: uppercase; letter-spacing: 0.5px; }
+textarea { width: 100%; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 12px; border-radius: 8px; font-size: 15px; resize: vertical; min-height: 80px; font-family: inherit; }
+textarea:focus { outline: none; border-color: #555; }
+.photos-area { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.photo-thumb { width: 80px; height: 80px; border-radius: 8px; object-fit: cover; border: 1px solid #333; }
+.add-photo { width: 80px; height: 80px; border-radius: 8px; border: 2px dashed #444; display: flex; align-items: center; justify-content: center; cursor: pointer; color: #666; font-size: 28px; transition: border-color 0.2s; }
+.add-photo:hover { border-color: #888; color: #aaa; }
+input[type="file"] { display: none; }
+button.go { width: 100%; padding: 14px; background: #fff; color: #000; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+button.go:hover { opacity: 0.85; }
+button.go:disabled { opacity: 0.3; cursor: not-allowed; }
+.log { margin-top: 24px; }
+.log-entry { padding: 8px 12px; background: #1a1a1a; border-radius: 6px; margin-bottom: 6px; font-size: 14px; border-left: 3px solid #333; }
+.log-entry.active { border-left-color: #f0c040; }
+.log-entry.done { border-left-color: #4caf50; }
+.log-entry.error { border-left-color: #f44; color: #f88; }
+.brief { margin-top: 16px; padding: 12px; background: #1a1a1a; border-radius: 8px; font-size: 13px; line-height: 1.5; color: #bbb; white-space: pre-wrap; }
+.brief b { color: #eee; }
+.result { margin-top: 24px; }
+.result img { width: 100%; border-radius: 8px; margin-bottom: 12px; }
+.result video { width: 100%; border-radius: 8px; background: #000; }
+.spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #555; border-top-color: #f0c040; border-radius: 50%; animation: spin 0.8s linear infinite; margin-right: 8px; vertical-align: middle; }
+@keyframes spin { to { transform: rotate(360deg); } }
+.history { margin-top: 40px; border-top: 1px solid #222; padding-top: 20px; }
+.history h2 { font-size: 16px; font-weight: 500; margin-bottom: 12px; color: #888; }
+.history-item { display: flex; gap: 12px; padding: 12px; background: #1a1a1a; border-radius: 8px; margin-bottom: 8px; cursor: pointer; transition: background 0.2s; }
+.history-item:hover { background: #222; }
+.history-item img { width: 60px; height: 60px; border-radius: 6px; object-fit: cover; flex-shrink: 0; }
+.history-item .info { font-size: 13px; color: #aaa; overflow: hidden; }
+.history-item .info .title { color: #eee; margin-bottom: 4px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.download-row { display: flex; gap: 8px; margin-top: 12px; }
+.download-row a { padding: 8px 16px; background: #222; color: #eee; text-decoration: none; border-radius: 6px; font-size: 13px; transition: background 0.2s; }
+.download-row a:hover { background: #333; }
+</style>
+</head>
+<body>
+<div class="app">
+  <h1>Imagine Tool</h1>
+
+  <div class="form-group">
+    <label>Идея</label>
+    <textarea id="idea" placeholder="Опиши что хочешь: горы Осетии, кофейня, фитнес, реклама мерседеса..."></textarea>
+  </div>
+
+  <div class="form-group">
+    <label>Референсы (до 3 фото)</label>
+    <div class="photos-area" id="photosArea">
+      <div class="add-photo" id="addPhoto" title="Добавить фото">+</div>
+    </div>
+    <input type="file" id="fileInput" accept="image/*" multiple>
+  </div>
+
+  <button class="go" id="goBtn" onclick="startGeneration()">Создать картинку + видео</button>
+
+  <div class="log" id="log"></div>
+  <div id="briefBox"></div>
+  <div class="result" id="result"></div>
+
+  <div class="history" id="historySection" style="display:none">
+    <h2>История</h2>
+    <div id="historyList"></div>
+  </div>
+</div>
+
+<script>
+const photoFiles = [];
+const MAX_PHOTOS = 3;
+let history = JSON.parse(localStorage.getItem('imagine_history') || '[]');
+
+const fileInput = document.getElementById('fileInput');
+const photosArea = document.getElementById('photosArea');
+const addPhotoBtn = document.getElementById('addPhoto');
+
+addPhotoBtn.addEventListener('click', () => {
+  if (photoFiles.length < MAX_PHOTOS) fileInput.click();
+});
+
+fileInput.addEventListener('change', (e) => {
+  for (const f of e.target.files) {
+    if (photoFiles.length >= MAX_PHOTOS) break;
+    photoFiles.push(f);
+    const img = document.createElement('img');
+    img.className = 'photo-thumb';
+    img.src = URL.createObjectURL(f);
+    photosArea.insertBefore(img, addPhotoBtn);
+  }
+  if (photoFiles.length >= MAX_PHOTOS) addPhotoBtn.style.display = 'none';
+  fileInput.value = '';
+});
+
+function addLog(msg, cls = '') {
+  const log = document.getElementById('log');
+  const div = document.createElement('div');
+  div.className = 'log-entry ' + cls;
+  div.innerHTML = (cls === 'active' ? '<span class="spinner"></span>' : '') + msg;
+  log.appendChild(div);
+  div.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  return div;
+}
+
+function clearResults() {
+  document.getElementById('log').innerHTML = '';
+  document.getElementById('briefBox').innerHTML = '';
+  document.getElementById('result').innerHTML = '';
+}
+
+async function startGeneration() {
+  const idea = document.getElementById('idea').value.trim();
+  if (!idea) { alert('Напиши идею'); return; }
+
+  const btn = document.getElementById('goBtn');
+  btn.disabled = true;
+  clearResults();
+
+  const fd = new FormData();
+  fd.append('idea', idea);
+  photoFiles.forEach((f, i) => fd.append('photo' + i, f));
+
+  let activeLog = addLog('Отправляю...', 'active');
+
+  try {
+    const resp = await fetch('/api/generate', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+
+    const jobId = data.job_id;
+    activeLog.remove();
+
+    const es = new EventSource('/api/stream/' + jobId);
+    let imageUrl = null;
+    let videoUrl = null;
+
+    es.onmessage = (e) => {
+      const ev = JSON.parse(e.data);
+
+      // Remove previous active
+      document.querySelectorAll('.log-entry.active').forEach(el => {
+        el.classList.remove('active');
+        el.querySelector('.spinner')?.remove();
+      });
+
+      if (ev.step === 'error') {
+        addLog(ev.msg, 'error');
+        es.close();
+        btn.disabled = false;
+        return;
+      }
+
+      if (ev.step === 'done') {
+        addLog('Готово!', 'done');
+        videoUrl = ev.video;
+        if (videoUrl) {
+          const r = document.getElementById('result');
+          r.innerHTML += `<video controls autoplay loop><source src="${videoUrl}" type="video/mp4"></video>`;
+          r.innerHTML += `<div class="download-row">
+            ${imageUrl ? `<a href="${imageUrl}" download>Скачать картинку</a>` : ''}
+            <a href="${videoUrl}" download>Скачать видео</a>
+          </div>`;
+        }
+        saveHistory(idea, imageUrl, videoUrl);
+        es.close();
+        btn.disabled = false;
+        return;
+      }
+
+      if (ev.step === 'gpt_done') {
+        addLog('Бриф готов', '');
+        const bb = document.getElementById('briefBox');
+        bb.innerHTML = `<div class="brief"><b>Картинка:</b> ${esc(ev.img_prompt)}\n\n<b>Видео:</b> ${esc(ev.vid_prompt)}</div>`;
+      } else if (ev.step === 'dalle_done') {
+        addLog('Картинка готова!', '');
+        imageUrl = ev.image;
+        if (imageUrl) {
+          document.getElementById('result').innerHTML = `<img src="${imageUrl}">`;
+        }
+      } else {
+        addLog(ev.msg, 'active');
+      }
+    };
+
+    es.onerror = () => {
+      es.close();
+      btn.disabled = false;
+    };
+
+  } catch (err) {
+    addLog('Ошибка: ' + err.message, 'error');
+    btn.disabled = false;
+  }
+}
+
+function esc(s) {
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function saveHistory(idea, img, vid) {
+  history.unshift({ idea, img, vid, ts: Date.now() });
+  if (history.length > 20) history = history.slice(0, 20);
+  localStorage.setItem('imagine_history', JSON.stringify(history));
+  renderHistory();
+}
+
+function renderHistory() {
+  if (!history.length) return;
+  document.getElementById('historySection').style.display = '';
+  const list = document.getElementById('historyList');
+  list.innerHTML = history.map(h => `
+    <div class="history-item" onclick="showHistoryItem('${esc(h.img || '')}', '${esc(h.vid || '')}')">
+      ${h.img ? `<img src="${h.img}">` : ''}
+      <div class="info">
+        <div class="title">${esc(h.idea)}</div>
+        <div>${new Date(h.ts).toLocaleString('ru')}</div>
+      </div>
+    </div>
+  `).join('');
+}
+
+function showHistoryItem(img, vid) {
+  const r = document.getElementById('result');
+  r.innerHTML = '';
+  if (img) r.innerHTML += `<img src="${img}">`;
+  if (vid) r.innerHTML += `<video controls autoplay loop><source src="${vid}" type="video/mp4"></video>`;
+  if (img || vid) {
+    r.innerHTML += `<div class="download-row">
+      ${img ? `<a href="${img}" download>Скачать картинку</a>` : ''}
+      ${vid ? `<a href="${vid}" download>Скачать видео</a>` : ''}
+    </div>`;
+  }
+  r.scrollIntoView({ behavior: 'smooth' });
+}
+
+renderHistory();
+</script>
+</body>
+</html>
