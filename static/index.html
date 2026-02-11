@@ -92,6 +92,11 @@ button.reset:hover { color: #eee; border-color: #666; }
     </div>
   </div>
 
+  <div class="form-group">
+    <label>Пароль</label>
+    <input type="password" id="password" placeholder="Введи пароль" style="width:100%;background:#1a1a1a;border:1px solid #333;color:#eee;padding:12px;border-radius:8px;font-size:15px;font-family:inherit;">
+  </div>
+
   <div class="btn-row">
     <button class="go" id="goBtn" onclick="startGeneration()" style="flex:1">Создать картинку + видео</button>
     <button class="reset" onclick="resetAll()" title="Сбросить всё">Сброс</button>
@@ -193,6 +198,8 @@ function clearResults() {
 async function startGeneration() {
   const idea = document.getElementById('idea').value.trim();
   if (!idea) { alert('Напиши идею'); return; }
+  const password = document.getElementById('password').value;
+  if (!password) { alert('Введи пароль'); return; }
 
   const btn = document.getElementById('goBtn');
   btn.disabled = true;
@@ -200,6 +207,7 @@ async function startGeneration() {
 
   const fd = new FormData();
   fd.append('idea', idea);
+  fd.append('password', password);
   fd.append('video_provider', selectedProvider);
   photoFiles.forEach((f, i) => fd.append('photo' + i, f));
 
@@ -262,7 +270,7 @@ async function startGeneration() {
           r.innerHTML += `<video controls autoplay loop><source src="${ev.video}" type="video/mp4"></video>`;
         }
 
-        // Download row
+        // Download row with alternatives
         let dl = '<div class="download-row">';
         if (imageUrl) dl += `<a href="${imageUrl}" download>Скачать картинку</a>`;
         if (ev.videos) {
@@ -270,6 +278,15 @@ async function startGeneration() {
             dl += `<a href="${v.url}" download>Скачать ${esc(v.provider)}</a>`;
           }
         }
+        dl += '</div>';
+        // Alt services
+        dl += '<div class="download-row" style="margin-top:8px">';
+        dl += '<span style="font-size:12px;color:#666;line-height:32px">Альтернативы:</span>';
+        dl += '<a href="https://hedra.com/app" target="_blank" rel="noopener">Hedra</a>';
+        dl += '<a href="https://sora.com" target="_blank" rel="noopener">Sora</a>';
+        dl += '<a href="https://klingai.com" target="_blank" rel="noopener">Kling</a>';
+        dl += '<a href="https://runwayml.com" target="_blank" rel="noopener">Runway</a>';
+        dl += '<a href="https://www.midjourney.com" target="_blank" rel="noopener">Midjourney</a>';
         dl += '</div>';
         r.innerHTML += dl;
 

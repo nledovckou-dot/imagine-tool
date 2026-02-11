@@ -26,7 +26,6 @@ _OPENAI_BASE = os.environ.get("OPENAI_BASE_URL", "https://api.openai.com/v1").st
 _KLING_ACCESS = os.environ.get("KLING_ACCESS_KEY", "").strip()
 _KLING_SECRET = os.environ.get("KLING_SECRET_KEY", "").strip()
 _HEDRA_KEY = os.environ.get("HEDRA_API_KEY", "").strip()
-_HEDRA_BASE = os.environ.get("HEDRA_BASE_URL", "https://mercury.dev.dream-ai.com/api").strip().rstrip("/")
 _FAL_KEY = os.environ.get("FAL_KEY", "").strip()
 _FAL_BASE = "https://queue.fal.run"
 _GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
@@ -34,6 +33,7 @@ _GEMINI_BASE = os.environ.get("GEMINI_BASE_URL", "").strip().rstrip("/")
 _GEMINI_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview")
 _YANDEX_API_KEY = os.environ.get("YANDEX_GPT_API_KEY", "").strip()
 _YANDEX_FOLDER = os.environ.get("YANDEX_FOLDER_ID", "").strip()
+_APP_PASSWORD = os.environ.get("APP_PASSWORD", "123321")
 _OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(_OUTPUT_DIR, exist_ok=True)
 
@@ -704,110 +704,107 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
     raise RuntimeError("Kling: таймаут (3 мин)")
 
 
-# ── Hedra (new API at api.hedra.com) ──
+# ── Hedra (new API at api.hedra.com — official starter format) ──
 
 _HEDRA_API = "https://api.hedra.com/web-app/public"
-# Most-used video model from user's history
-_HEDRA_VIDEO_MODEL = "d5af0ed3-c505-4495-802b-efb3e8ea741c"
+_HEDRA_VIDEO_MODEL = "d1dd37a3-e39a-4854-a298-6510289f9cf2"  # official default
 
 
 def _hedra_request(method: str, path: str, body: Optional[dict] = None, timeout: int = 60) -> dict:
-    """Make authenticated request to new Hedra API."""
+    """Make authenticated JSON request to Hedra API."""
     url = f"{_HEDRA_API}{path}"
     data = json.dumps(body).encode("utf-8") if body else None
     req = urllib.request.Request(url, data=data, method=method)
     req.add_header("X-API-Key", _HEDRA_KEY)
-    req.add_header("Content-Type", "application/json")
+    if data is not None:
+        req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except urllib.error.HTTPError as e:
-        err = e.read().decode("utf-8")[:300] if e.fp else ""
+        err = e.read().decode("utf-8")[:500] if e.fp else ""
         raise RuntimeError(f"Hedra HTTP {e.code}: {err}") from e
 
 
 def _hedra_upload_image(image_path: str) -> str:
-    """Upload image to Hedra and return the asset URL."""
+    """Upload image to Hedra via 2-step flow: create asset → upload file."""
+    fname = os.path.basename(image_path)
+
+    # Step 1: Create asset record
+    create_resp = _hedra_request("POST", "/assets", body={"name": fname, "type": "image"})
+    asset_id = create_resp.get("id")
+    if not asset_id:
+        raise RuntimeError(f"Hedra: no asset id from create: {create_resp}")
+    print(f"[hedra] Created asset: {asset_id}", flush=True)
+
+    # Step 2: Upload file to the asset
     with open(image_path, "rb") as f:
         img_bytes = f.read()
-    mime = detect_mime(img_bytes)
 
-    # Upload via multipart to assets endpoint
     boundary = f"----HedraUp{int(time.time())}"
-    fname = os.path.basename(image_path)
     parts = [
         f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
-        f"filename=\"{fname}\"\r\nContent-Type: {mime}\r\n\r\n".encode(),
+        f"filename=\"{fname}\"\r\nContent-Type: application/octet-stream\r\n\r\n".encode(),
         img_bytes,
         f"\r\n--{boundary}--\r\n".encode(),
     ]
     body = b"".join(parts)
-    url = f"{_HEDRA_API}/assets"
+    url = f"{_HEDRA_API}/assets/{asset_id}/upload"
     req = urllib.request.Request(url, data=body, method="POST")
     req.add_header("X-API-Key", _HEDRA_KEY)
     req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
     try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            result = json.loads(resp.read().decode("utf-8"))
+        with urllib.request.urlopen(req, timeout=120) as resp:
+            resp.read()  # consume response
     except urllib.error.HTTPError as e:
         err = e.read().decode("utf-8")[:300] if e.fp else ""
         raise RuntimeError(f"Hedra upload HTTP {e.code}: {err}") from e
 
-    asset_id = result.get("id") or result.get("asset_id")
-    if not asset_id:
-        raise RuntimeError(f"Hedra upload: no asset_id: {result}")
+    print(f"[hedra] Uploaded image to asset {asset_id}", flush=True)
     return asset_id
 
 
 def generate_hedra_video(image_path: str, text: str) -> str:
-    """Generate video via Hedra new API (image-to-video)."""
+    """Generate video via Hedra API (image-to-video)."""
     if not _HEDRA_KEY:
         raise RuntimeError("HEDRA_API_KEY not configured")
 
-    # Upload keyframe image
+    # Upload keyframe image (2-step)
     print(f"[hedra] Uploading keyframe: {image_path}", flush=True)
-    try:
-        asset_id = _hedra_upload_image(image_path)
-        print(f"[hedra] Keyframe asset: {asset_id}", flush=True)
-    except Exception:
-        asset_id = None
+    image_id = _hedra_upload_image(image_path)
 
-    # Create video generation
+    # Create video generation (official format from hedra-api-starter)
     payload = {
         "type": "video",
         "ai_model_id": _HEDRA_VIDEO_MODEL,
+        "start_keyframe_id": image_id,
         "generated_video_inputs": {
             "text_prompt": text[:2000],
+            "resolution": "720p",
+            "aspect_ratio": "16:9",
         },
         "batch_size": 1,
     }
-    if asset_id:
-        payload["start_keyframe_id"] = asset_id
 
-    print(f"[hedra] Starting video generation...", flush=True)
+    print(f"[hedra] Starting video generation (model={_HEDRA_VIDEO_MODEL})...", flush=True)
     gen_resp = _hedra_request("POST", "/generations", body=payload, timeout=60)
 
     gen_id = gen_resp.get("id")
     if not gen_id:
         raise RuntimeError(f"Hedra: no generation id: {gen_resp}")
+    print(f"[hedra] Generation ID: {gen_id}", flush=True)
 
-    # Poll for completion (max 5 min)
+    # Poll for completion via /status endpoint (max 5 min)
     deadline = time.time() + 300
     while time.time() < deadline:
-        time.sleep(10)
-        status = _hedra_request("GET", f"/generations/{gen_id}")
+        time.sleep(8)
+        status = _hedra_request("GET", f"/generations/{gen_id}/status")
         state = status.get("status", "")
 
         if state == "complete":
-            asset = status.get("asset", {})
-            video_url = asset.get("url") or asset.get("asset", {}).get("url", "")
+            video_url = status.get("download_url") or status.get("url", "")
             if not video_url:
-                # Try batch_results
-                batch = status.get("batch_results", [])
-                if batch:
-                    video_url = batch[0].get("asset", {}).get("url", "")
-            if not video_url:
-                raise RuntimeError(f"Hedra: complete but no video URL: {status}")
+                raise RuntimeError(f"Hedra: complete but no download_url: {status}")
 
             with urllib.request.urlopen(video_url, timeout=120) as resp:
                 vbytes = resp.read()
@@ -823,12 +820,14 @@ def generate_hedra_video(image_path: str, text: str) -> str:
                 except OSError:
                     pass
                 raise
+            print(f"[hedra] Downloaded video: {fpath} ({len(vbytes)} bytes)", flush=True)
             return fpath
 
         if state == "error":
-            raise RuntimeError(f"Hedra failed: {status.get('error', status)}")
+            err_msg = status.get("error_message") or status.get("error", str(status))
+            raise RuntimeError(f"Hedra failed: {err_msg}")
 
-        print(f"[hedra] Status: {state}, progress: {status.get('progress', '?')}", flush=True)
+        print(f"[hedra] Status: {state}", flush=True)
 
     raise RuntimeError("Hedra: таймаут (5 мин)")
 
@@ -1137,6 +1136,11 @@ def serve_output(filename):
 
 @app.route("/api/generate", methods=["POST"])
 def api_generate():
+    # Password check
+    password = request.form.get("password", "").strip()
+    if password != _APP_PASSWORD:
+        return jsonify({"error": "Неверный пароль"}), 403
+
     if not _OPENAI_KEY and not _GEMINI_KEY and not _FAL_KEY:
         return jsonify({"error": "No API keys configured (need GEMINI_API_KEY, OPENAI_API_KEY or FAL_KEY)"}), 500
 
