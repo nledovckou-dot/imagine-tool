@@ -37,6 +37,78 @@ _APP_PASSWORD = os.environ.get("APP_PASSWORD", "123321")
 _OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(_OUTPUT_DIR, exist_ok=True)
 
+# ── Rate limiter for Gemini free tier ──
+
+class RateLimiter:
+    """Thread-safe rate limiter: max N requests per window_sec."""
+    def __init__(self, rpm: int = 4, rpd: int = 90):
+        self._rpm = rpm
+        self._rpd = rpd
+        self._lock = threading.Lock()
+        self._minute_ts: list[float] = []
+        self._day_ts: list[float] = []
+
+    def wait_if_needed(self) -> bool:
+        """Wait if rate limit would be exceeded. Returns False if daily limit hit."""
+        with self._lock:
+            now = time.time()
+            # Clean old entries
+            self._minute_ts = [t for t in self._minute_ts if now - t < 60]
+            self._day_ts = [t for t in self._day_ts if now - t < 86400]
+            # Check daily limit
+            if len(self._day_ts) >= self._rpd:
+                return False
+            # Wait for minute window if needed
+            if len(self._minute_ts) >= self._rpm:
+                wait = 60 - (now - self._minute_ts[0]) + 0.5
+                if wait > 0:
+                    self._lock.release()
+                    time.sleep(wait)
+                    self._lock.acquire()
+                    now = time.time()
+                    self._minute_ts = [t for t in self._minute_ts if now - t < 60]
+            self._minute_ts.append(now)
+            self._day_ts.append(now)
+            return True
+
+_gemini_limiter = RateLimiter(rpm=4, rpd=90)  # conservative: 4 RPM, 90 RPD
+
+# ── Circuit breaker ──
+
+class CircuitBreaker:
+    """Disable provider after consecutive failures, auto-recover after cooldown."""
+    def __init__(self, max_failures: int = 3, cooldown_sec: int = 300):
+        self._max = max_failures
+        self._cooldown = cooldown_sec
+        self._lock = threading.Lock()
+        self._failures: dict[str, int] = {}
+        self._disabled_until: dict[str, float] = {}
+
+    def is_open(self, provider: str) -> bool:
+        with self._lock:
+            until = self._disabled_until.get(provider, 0)
+            if until and time.time() < until:
+                return True
+            if until and time.time() >= until:
+                # Cooldown passed, reset
+                self._failures[provider] = 0
+                self._disabled_until[provider] = 0
+            return False
+
+    def record_success(self, provider: str):
+        with self._lock:
+            self._failures[provider] = 0
+            self._disabled_until[provider] = 0
+
+    def record_failure(self, provider: str):
+        with self._lock:
+            self._failures[provider] = self._failures.get(provider, 0) + 1
+            if self._failures[provider] >= self._max:
+                self._disabled_until[provider] = time.time() + self._cooldown
+                print(f"[circuit] {provider} disabled for {self._cooldown}s after {self._max} failures", flush=True)
+
+_breaker = CircuitBreaker(max_failures=3, cooldown_sec=300)
+
 # ── Job tracking ──
 
 _jobs: dict[str, dict] = {}  # job_id → {status, progress_queue, result, ...}
@@ -154,6 +226,10 @@ def gemini_creative_prompts(idea: str, ref_images: list[tuple[bytes, str]] | Non
     data = json.dumps(payload).encode("utf-8")
     url = f"{base_url}/v1beta/models/gemini-2.0-flash:generateContent"
 
+    # Rate limit check
+    if not _gemini_limiter.wait_if_needed():
+        raise RuntimeError("Gemini: дневной лимит запросов исчерпан")
+
     last_exc = None
     for attempt in range(3):
         req = urllib.request.Request(url, data=data, method="POST")
@@ -168,18 +244,23 @@ def gemini_creative_prompts(idea: str, ref_images: list[tuple[bytes, str]] | Non
             text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
             if not text:
                 raise RuntimeError("Gemini brief: empty response")
+            _breaker.record_success("gemini_brief")
             return _parse_brief(text)
         except urllib.error.HTTPError as e:
             err = e.read().decode("utf-8")[:300] if e.fp else ""
             last_exc = RuntimeError(f"Gemini brief HTTP {e.code}: {err}")
             if e.code == 429:
-                time.sleep((2 ** attempt) * 3)  # 3, 6, 12 sec
+                _gemini_limiter.wait_if_needed()  # extra wait
+                time.sleep((2 ** attempt) * 3)
                 continue
+            _breaker.record_failure("gemini_brief")
             raise last_exc from e
         except (TimeoutError, OSError) as e:
             last_exc = RuntimeError(str(e))
+            _breaker.record_failure("gemini_brief")
             time.sleep((2 ** attempt) * 2)
             continue
+    _breaker.record_failure("gemini_brief")
     raise last_exc or RuntimeError("Gemini brief: all retries failed")
 
 
@@ -309,6 +390,10 @@ def generate_gemini_image(prompt: str) -> str:
     }
     data = json.dumps(payload).encode("utf-8")
 
+    # Rate limit check
+    if not _gemini_limiter.wait_if_needed():
+        raise RuntimeError("Gemini image: дневной лимит запросов исчерпан")
+
     last_exc = None
     for attempt in range(3):
         req = urllib.request.Request(url, data=data, headers=headers, method="POST")
@@ -337,19 +422,24 @@ def generate_gemini_image(prompt: str) -> str:
                         except OSError:
                             pass
                         raise
+                    _breaker.record_success("gemini_image")
                     return fpath
             raise RuntimeError("Gemini: no image in response")
         except urllib.error.HTTPError as e:
             err = e.read().decode("utf-8")[:300] if e.fp else ""
             last_exc = RuntimeError(f"Gemini HTTP {e.code}: {err}")
             if e.code in (429, 500, 502, 503):
+                _gemini_limiter.wait_if_needed()
                 time.sleep((2 ** attempt) * 2)
                 continue
+            _breaker.record_failure("gemini_image")
             raise last_exc from e
         except (TimeoutError, OSError) as e:
             last_exc = RuntimeError(str(e))
+            _breaker.record_failure("gemini_image")
             time.sleep((2 ** attempt) * 2)
             continue
+    _breaker.record_failure("gemini_image")
     raise last_exc or RuntimeError("Gemini: all retries failed")
 
 
@@ -774,9 +864,10 @@ def generate_hedra_video(image_path: str, text: str) -> str:
     image_id = _hedra_upload_image(image_path)
 
     # Create video generation (official format from hedra-api-starter)
+    model_id = os.environ.get("_HEDRA_MODEL_OVERRIDE", _HEDRA_VIDEO_MODEL)
     payload = {
         "type": "video",
-        "ai_model_id": _HEDRA_VIDEO_MODEL,
+        "ai_model_id": model_id,
         "start_keyframe_id": image_id,
         "generated_video_inputs": {
             "text_prompt": text[:2000],
@@ -787,7 +878,7 @@ def generate_hedra_video(image_path: str, text: str) -> str:
         "batch_size": 1,
     }
 
-    print(f"[hedra] Starting video generation (model={_HEDRA_VIDEO_MODEL})...", flush=True)
+    print(f"[hedra] Starting video generation (model={model_id})...", flush=True)
     gen_resp = _hedra_request("POST", "/generations", body=payload, timeout=60)
 
     gen_id = gen_resp.get("id")
@@ -950,7 +1041,7 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
         emit("Создаю креативный бриф...", step="gpt")
 
         # Try Gemini Flash (FREE)
-        if _GEMINI_KEY:
+        if _GEMINI_KEY and not _breaker.is_open("gemini_brief"):
             try:
                 img_prompt, vid_prompt = gemini_creative_prompts(idea, ref_images if ref_images else None)
                 brief_source = "Gemini"
@@ -982,7 +1073,7 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
         img_source = ""
 
         # Try Gemini (FREE)
-        if _GEMINI_KEY:
+        if _GEMINI_KEY and not _breaker.is_open("gemini_image"):
             try:
                 emit("Генерирую картинку (Gemini)...", step="dalle")
                 img_path = generate_gemini_image(img_prompt)
@@ -1014,8 +1105,28 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
         # 3. Resize for video (1080p)
         video_img = resize_for_video(img_path, 1920, 1080)
 
-        # 4. Video — run selected provider(s)
-        # Provider map: name → (function, args)
+        # 4. Video — with auto-fallback chain
+        # Hedra model IDs for fallback (cheapest first)
+        _HEDRA_MODELS = {
+            "hedra": ("fb657777-6b02-478d-87a9-e02e8c53748c", "Hedra Veo3"),
+            "hedra_minimax": ("b917e7da-f0a4-42d1-b52f-67ee11569cc8", "Hedra MiniMax"),
+            "hedra_kling": ("0e451fde-9e6f-48e6-83a9-222f6cc05eba", "Hedra Kling"),
+            "hedra_veo3fast": ("9963e814-d1ee-4518-a844-7ed380ddbb20", "Hedra Veo3 Fast"),
+        }
+
+        def _hedra_with_model(model_id: str, img: str, prompt: str) -> str:
+            """Generate video via Hedra with a specific model."""
+            old_model = os.environ.get("_HEDRA_MODEL_OVERRIDE")
+            os.environ["_HEDRA_MODEL_OVERRIDE"] = model_id
+            try:
+                return generate_hedra_video(img, prompt)
+            finally:
+                if old_model:
+                    os.environ["_HEDRA_MODEL_OVERRIDE"] = old_model
+                else:
+                    os.environ.pop("_HEDRA_MODEL_OVERRIDE", None)
+
+        # Provider map: key → (display_name, function, args)
         _provider_map = {
             "veo3": ("Veo 3", generate_veo3_video, (video_img, vid_prompt)),
             "hedra": ("Hedra", generate_hedra_video, (video_img, vid_prompt)),
@@ -1029,8 +1140,16 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
             "kling": bool(_KLING_ACCESS and _KLING_SECRET),
         }
 
+        # Fallback chains: if primary fails, try these next
+        _fallback_chain = {
+            "veo3": ["hedra", "hedra_veo3fast", "sora"],
+            "hedra": ["hedra_minimax", "hedra_kling", "hedra_veo3fast", "veo3"],
+            "sora": ["hedra", "hedra_veo3fast", "veo3"],
+            "kling": ["hedra_kling", "hedra", "hedra_minimax"],
+        }
+
         if video_provider == "all":
-            # Run all available providers in parallel
+            # Run all available providers in parallel (no fallback for parallel)
             chosen = [k for k in _provider_map if _provider_available.get(k)]
         else:
             chosen = [video_provider] if _provider_available.get(video_provider) else []
@@ -1041,20 +1160,60 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
         video_errors = []
 
         if len(chosen) == 1:
-            # Single provider — sequential
+            # Single provider with auto-fallback
             pkey = chosen[0]
             pname, pfn, pargs = _provider_map[pkey]
-            emit(f"Генерирую видео ({pname})...", step="video")
-            try:
-                vpath = pfn(*pargs)
-                vid_name = os.path.basename(vpath)
-                videos = [{"provider": pname, "url": f"/output/{vid_name}"}]
-            except Exception as e:
-                video_errors.append(f"{pname}: {str(e)[:120]}")
-                emit(f"{pname}: {str(e)[:100]}", step="video_error")
-                videos = []
+            videos = []
+
+            # Try primary
+            if not _breaker.is_open(pkey):
+                emit(f"Генерирую видео ({pname})...", step="video")
+                try:
+                    vpath = pfn(*pargs)
+                    vid_name = os.path.basename(vpath)
+                    videos = [{"provider": pname, "url": f"/output/{vid_name}"}]
+                    _breaker.record_success(pkey)
+                except Exception as e:
+                    _breaker.record_failure(pkey)
+                    video_errors.append(f"{pname}: {str(e)[:120]}")
+                    emit(f"{pname} не удалось: {str(e)[:80]}. Пробую запасной...", step="video_error")
+            else:
+                emit(f"{pname} временно отключён (3 ошибки подряд). Пробую запасной...", step="video_error")
+
+            # Auto-fallback chain
+            if not videos and _HEDRA_KEY:
+                fallbacks = _fallback_chain.get(pkey, [])
+                for fb_key in fallbacks:
+                    if _breaker.is_open(fb_key):
+                        continue
+                    if fb_key in _HEDRA_MODELS:
+                        model_id, fb_name = _HEDRA_MODELS[fb_key]
+                        emit(f"Пробую {fb_name}...", step="video")
+                        try:
+                            vpath = _hedra_with_model(model_id, video_img, vid_prompt)
+                            vid_name = os.path.basename(vpath)
+                            videos = [{"provider": fb_name, "url": f"/output/{vid_name}"}]
+                            _breaker.record_success(fb_key)
+                            break
+                        except Exception as e:
+                            _breaker.record_failure(fb_key)
+                            video_errors.append(f"{fb_name}: {str(e)[:120]}")
+                            emit(f"{fb_name}: {str(e)[:80]}", step="video_error")
+                    elif fb_key in _provider_map and _provider_available.get(fb_key):
+                        fb_name, fb_fn, fb_args = _provider_map[fb_key]
+                        emit(f"Пробую {fb_name}...", step="video")
+                        try:
+                            vpath = fb_fn(*fb_args)
+                            vid_name = os.path.basename(vpath)
+                            videos = [{"provider": fb_name, "url": f"/output/{vid_name}"}]
+                            _breaker.record_success(fb_key)
+                            break
+                        except Exception as e:
+                            _breaker.record_failure(fb_key)
+                            video_errors.append(f"{fb_name}: {str(e)[:120]}")
+                            emit(f"{fb_name}: {str(e)[:80]}", step="video_error")
         else:
-            # Multiple providers — parallel
+            # Multiple providers — parallel (no fallback)
             names = [_provider_map[k][0] for k in chosen]
             emit(f"Генерирую видео ({' + '.join(names)} параллельно)...", step="video")
             results: dict[str, dict] = {}
@@ -1198,6 +1357,59 @@ def api_stream(job_id):
 @app.route("/api/history")
 def api_history():
     return jsonify(_load_history())
+
+
+@app.route("/api/health")
+def api_health():
+    """Health check: provider status, credits, circuit breaker state."""
+    providers = {}
+
+    # Gemini
+    providers["gemini_brief"] = {
+        "configured": bool(_GEMINI_KEY),
+        "circuit_open": _breaker.is_open("gemini_brief"),
+        "rate_limit": f"{len(_gemini_limiter._minute_ts)}/{_gemini_limiter._rpm} RPM, "
+                      f"{len(_gemini_limiter._day_ts)}/{_gemini_limiter._rpd} RPD",
+    }
+    providers["gemini_image"] = {
+        "configured": bool(_GEMINI_KEY),
+        "circuit_open": _breaker.is_open("gemini_image"),
+    }
+
+    # Hedra — check credits
+    hedra_credits = None
+    if _HEDRA_KEY:
+        try:
+            resp_data = _hedra_request("GET", "/billing/credits")
+            hedra_credits = resp_data
+        except Exception:
+            hedra_credits = "error checking"
+    providers["hedra"] = {
+        "configured": bool(_HEDRA_KEY),
+        "circuit_open": _breaker.is_open("hedra"),
+        "credits": hedra_credits,
+    }
+
+    # OpenAI (Sora + DALL-E)
+    providers["sora"] = {
+        "configured": bool(_OPENAI_KEY),
+        "circuit_open": _breaker.is_open("sora"),
+    }
+    providers["dalle"] = {
+        "configured": bool(_OPENAI_KEY),
+    }
+
+    # Kling
+    providers["kling"] = {
+        "configured": bool(_KLING_ACCESS and _KLING_SECRET),
+        "circuit_open": _breaker.is_open("kling"),
+    }
+
+    return jsonify({
+        "status": "ok",
+        "providers": providers,
+        "active_jobs": sum(1 for j in _jobs.values() if j.get("status") == "running"),
+    })
 
 
 if __name__ == "__main__":
