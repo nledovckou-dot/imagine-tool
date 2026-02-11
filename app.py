@@ -31,7 +31,7 @@ _FAL_KEY = os.environ.get("FAL_KEY", "").strip()
 _FAL_BASE = "https://queue.fal.run"
 _GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 _GEMINI_BASE = os.environ.get("GEMINI_BASE_URL", "").strip().rstrip("/")
-_GEMINI_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.0-flash-exp")
+_GEMINI_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-2.5-flash-image")
 _YANDEX_API_KEY = os.environ.get("YANDEX_GPT_API_KEY", "").strip()
 _YANDEX_FOLDER = os.environ.get("YANDEX_FOLDER_ID", "").strip()
 _OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
@@ -159,25 +159,34 @@ def gemini_creative_prompts(idea: str, ref_images: list[tuple[bytes, str]] | Non
     }
     data = json.dumps(payload).encode("utf-8")
     url = f"{base_url}/v1beta/models/gemini-2.0-flash:generateContent"
-    req = urllib.request.Request(url, data=data, method="POST")
-    req.add_header("x-goog-api-key", _GEMINI_KEY)
-    req.add_header("Content-Type", "application/json")
 
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as e:
-        err = e.read().decode("utf-8")[:300] if e.fp else ""
-        raise RuntimeError(f"Gemini brief HTTP {e.code}: {err}") from e
-
-    candidates = body.get("candidates", [])
-    if not candidates:
-        raise RuntimeError("Gemini brief: no candidates")
-    text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
-    if not text:
-        raise RuntimeError("Gemini brief: empty response")
-
-    return _parse_brief(text)
+    last_exc = None
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=data, method="POST")
+        req.add_header("x-goog-api-key", _GEMINI_KEY)
+        req.add_header("Content-Type", "application/json")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                body = json.loads(resp.read().decode("utf-8"))
+            candidates = body.get("candidates", [])
+            if not candidates:
+                raise RuntimeError("Gemini brief: no candidates")
+            text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+            if not text:
+                raise RuntimeError("Gemini brief: empty response")
+            return _parse_brief(text)
+        except urllib.error.HTTPError as e:
+            err = e.read().decode("utf-8")[:300] if e.fp else ""
+            last_exc = RuntimeError(f"Gemini brief HTTP {e.code}: {err}")
+            if e.code == 429:
+                time.sleep((2 ** attempt) * 3)  # 3, 6, 12 sec
+                continue
+            raise last_exc from e
+        except (TimeoutError, OSError) as e:
+            last_exc = RuntimeError(str(e))
+            time.sleep((2 ** attempt) * 2)
+            continue
+    raise last_exc or RuntimeError("Gemini brief: all retries failed")
 
 
 # ── GPT creative prompts (fallback) ──
