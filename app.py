@@ -766,7 +766,8 @@ def generate_veo3_video(image_path: str, prompt: str) -> str:
     with open(image_path, "rb") as f:
         raw_bytes = f.read()
     image_b64 = base64.b64encode(raw_bytes).decode()
-    print(f"[veo3] Image: {len(raw_bytes)} bytes", flush=True)
+    mime = detect_mime(raw_bytes)
+    print(f"[veo3] Image: {len(raw_bytes)} bytes, mime={mime}", flush=True)
 
     # Gemini API base (direct or proxy)
     base_url = _GEMINI_BASE or "https://generativelanguage.googleapis.com"
@@ -775,7 +776,7 @@ def generate_veo3_video(image_path: str, prompt: str) -> str:
     payload = {
         "instances": [{
             "prompt": prompt,
-            "image": {"bytesBase64Encoded": image_b64},
+            "image": {"bytesBase64Encoded": image_b64, "mimeType": mime},
         }],
         "parameters": {
             "sampleCount": 1,

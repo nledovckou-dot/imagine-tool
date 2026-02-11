@@ -14,13 +14,19 @@ label { display: block; font-size: 13px; color: #888; margin-bottom: 6px; text-t
 textarea { width: 100%; background: #1a1a1a; border: 1px solid #333; color: #eee; padding: 12px; border-radius: 8px; font-size: 15px; resize: vertical; min-height: 80px; font-family: inherit; }
 textarea:focus { outline: none; border-color: #555; }
 .photos-area { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+.photo-wrapper { position: relative; width: 80px; height: 80px; flex-shrink: 0; }
 .photo-thumb { width: 80px; height: 80px; border-radius: 8px; object-fit: cover; border: 1px solid #333; }
+.photo-remove { position: absolute; top: -6px; right: -6px; width: 22px; height: 22px; background: #f44; color: #fff; border: 2px solid #111; border-radius: 50%; font-size: 13px; line-height: 18px; text-align: center; cursor: pointer; z-index: 1; }
+.photo-remove:hover { background: #d33; }
 .add-photo { width: 80px; height: 80px; border-radius: 8px; border: 2px dashed #444; display: flex; align-items: center; justify-content: center; cursor: pointer; color: #666; font-size: 28px; transition: border-color 0.2s; }
 .add-photo:hover { border-color: #888; color: #aaa; }
 input[type="file"] { display: none; }
 button.go { width: 100%; padding: 14px; background: #fff; color: #000; border: none; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
 button.go:hover { opacity: 0.85; }
 button.go:disabled { opacity: 0.3; cursor: not-allowed; }
+.btn-row { display: flex; gap: 8px; margin-top: 8px; }
+button.reset { flex: none; padding: 14px 20px; background: transparent; color: #888; border: 1px solid #333; border-radius: 8px; font-size: 14px; cursor: pointer; transition: all 0.2s; }
+button.reset:hover { color: #eee; border-color: #666; }
 .log { margin-top: 24px; }
 .log-entry { padding: 8px 12px; background: #1a1a1a; border-radius: 6px; margin-bottom: 6px; font-size: 14px; border-left: 3px solid #333; }
 .log-entry.active { border-left-color: #f0c040; }
@@ -69,7 +75,10 @@ button.go:disabled { opacity: 0.3; cursor: not-allowed; }
     <input type="file" id="fileInput" accept="image/*" multiple>
   </div>
 
-  <button class="go" id="goBtn" onclick="startGeneration()">Создать картинку + 3 видео</button>
+  <div class="btn-row">
+    <button class="go" id="goBtn" onclick="startGeneration()" style="flex:1">Создать картинку + 3 видео</button>
+    <button class="reset" onclick="resetAll()" title="Сбросить всё">Сброс</button>
+  </div>
 
   <div class="log" id="log"></div>
   <div id="briefBox"></div>
@@ -85,6 +94,7 @@ button.go:disabled { opacity: 0.3; cursor: not-allowed; }
 const photoFiles = [];
 const MAX_PHOTOS = 3;
 let history = [];
+let activeES = null; // track active EventSource for reset
 
 const fileInput = document.getElementById('fileInput');
 const photosArea = document.getElementById('photosArea');
@@ -98,14 +108,47 @@ fileInput.addEventListener('change', (e) => {
   for (const f of e.target.files) {
     if (photoFiles.length >= MAX_PHOTOS) break;
     photoFiles.push(f);
+  }
+  renderPhotos();
+  fileInput.value = '';
+});
+
+function renderPhotos() {
+  // Remove all existing wrappers
+  photosArea.querySelectorAll('.photo-wrapper').forEach(el => el.remove());
+  // Re-insert thumbs with X buttons before the + button
+  photoFiles.forEach((f, i) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'photo-wrapper';
     const img = document.createElement('img');
     img.className = 'photo-thumb';
     img.src = URL.createObjectURL(f);
-    photosArea.insertBefore(img, addPhotoBtn);
-  }
-  if (photoFiles.length >= MAX_PHOTOS) addPhotoBtn.style.display = 'none';
-  fileInput.value = '';
-});
+    const x = document.createElement('div');
+    x.className = 'photo-remove';
+    x.textContent = '\u00d7';
+    x.onclick = () => removePhoto(i);
+    wrap.appendChild(img);
+    wrap.appendChild(x);
+    photosArea.insertBefore(wrap, addPhotoBtn);
+  });
+  addPhotoBtn.style.display = photoFiles.length >= MAX_PHOTOS ? 'none' : '';
+}
+
+function removePhoto(idx) {
+  photoFiles.splice(idx, 1);
+  renderPhotos();
+}
+
+function resetAll() {
+  // Close active stream
+  if (activeES) { activeES.close(); activeES = null; }
+  // Clear form
+  document.getElementById('idea').value = '';
+  photoFiles.length = 0;
+  renderPhotos();
+  clearResults();
+  document.getElementById('goBtn').disabled = false;
+}
 
 function addLog(msg, cls = '') {
   const log = document.getElementById('log');
@@ -146,6 +189,7 @@ async function startGeneration() {
     activeLog.remove();
 
     const es = new EventSource('/api/stream/' + jobId);
+    activeES = es;
     let imageUrl = null;
 
     es.onmessage = (e) => {
@@ -159,7 +203,7 @@ async function startGeneration() {
 
       if (ev.step === 'error') {
         addLog(ev.msg, 'error');
-        es.close();
+        es.close(); activeES = null;
         btn.disabled = false;
         return;
       }
@@ -211,7 +255,7 @@ async function startGeneration() {
         }
 
         saveHistory();
-        es.close();
+        es.close(); activeES = null;
         btn.disabled = false;
         return;
       }
@@ -232,7 +276,7 @@ async function startGeneration() {
     };
 
     es.onerror = () => {
-      es.close();
+      es.close(); activeES = null;
       btn.disabled = false;
     };
 
