@@ -935,7 +935,7 @@ def generate_veo3_video(image_path: str, prompt: str) -> str:
 
 # ── Background job ──
 
-def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
+def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_provider: str = "veo3"):
     job = _jobs[job_id]
     q: queue.Queue = job["queue"]
 
@@ -1014,60 +1014,92 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
         # 3. Resize for video (1080p)
         video_img = resize_for_video(img_path, 1920, 1080)
 
-        # 4. Video — sequential: Veo 3 → Hedra → Sora → Kling
-        emit("Генерирую видео (Veo 3, 1080p)...", step="video")
-        video_path = None
-        video_provider = ""
+        # 4. Video — run selected provider(s)
+        # Provider map: name → (function, args)
+        _provider_map = {
+            "veo3": ("Veo 3", generate_veo3_video, (video_img, vid_prompt)),
+            "hedra": ("Hedra", generate_hedra_video, (video_img, vid_prompt)),
+            "sora": ("Sora", generate_sora_video, (video_img, vid_prompt, 8)),
+            "kling": ("Kling", generate_kling_video, (video_img, vid_prompt, 10)),
+        }
+        _provider_available = {
+            "veo3": bool(_GEMINI_KEY),
+            "hedra": bool(_HEDRA_KEY),
+            "sora": bool(_OPENAI_KEY),
+            "kling": bool(_KLING_ACCESS and _KLING_SECRET),
+        }
+
+        if video_provider == "all":
+            # Run all available providers in parallel
+            chosen = [k for k in _provider_map if _provider_available.get(k)]
+        else:
+            chosen = [video_provider] if _provider_available.get(video_provider) else []
+
+        if not chosen:
+            raise RuntimeError(f"Провайдер '{video_provider}' не настроен")
+
         video_errors = []
 
-        # Try Veo 3 (Gemini API, free in preview)
-        if _GEMINI_KEY:
+        if len(chosen) == 1:
+            # Single provider — sequential
+            pkey = chosen[0]
+            pname, pfn, pargs = _provider_map[pkey]
+            emit(f"Генерирую видео ({pname})...", step="video")
             try:
-                video_path = generate_veo3_video(video_img, vid_prompt)
-                video_provider = "Veo 3"
-            except Exception as veo_err:
-                video_errors.append(f"Veo 3: {str(veo_err)[:120]}")
-                emit(f"Veo 3: {str(veo_err)[:100]}. Пробую Hedra...", step="video_error")
-        # Fallback: Hedra (user has credits)
-        if not video_path and _HEDRA_KEY:
-            try:
-                emit("Генерирую видео (Hedra)...", step="video")
-                video_path = generate_hedra_video(video_img, vid_prompt)
-                video_provider = "Hedra"
-            except Exception as hedra_err:
-                video_errors.append(f"Hedra: {str(hedra_err)[:120]}")
-                emit(f"Hedra: {str(hedra_err)[:100]}. Пробую Sora...", step="video_error")
-        # Fallback: Sora (costs ~$1)
-        if not video_path and _OPENAI_KEY:
-            try:
-                emit("Генерирую видео (Sora)...", step="video")
-                video_path = generate_sora_video(video_img, vid_prompt, 8)
-                video_provider = "Sora"
-            except Exception as sora_err:
-                video_errors.append(f"Sora: {str(sora_err)[:120]}")
-                emit(f"Sora: {str(sora_err)[:100]}", step="video_error")
-        # Fallback: Kling
-        if not video_path and _KLING_ACCESS and _KLING_SECRET:
-            try:
-                emit("Генерирую видео (Kling)...", step="video")
-                video_path = generate_kling_video(video_img, vid_prompt, 10)
-                video_provider = "Kling"
-            except Exception as kling_err:
-                video_errors.append(f"Kling: {str(kling_err)[:120]}")
-                emit(f"Kling: {str(kling_err)[:100]}", step="video_error")
+                vpath = pfn(*pargs)
+                vid_name = os.path.basename(vpath)
+                videos = [{"provider": pname, "url": f"/output/{vid_name}"}]
+            except Exception as e:
+                video_errors.append(f"{pname}: {str(e)[:120]}")
+                emit(f"{pname}: {str(e)[:100]}", step="video_error")
+                videos = []
+        else:
+            # Multiple providers — parallel
+            names = [_provider_map[k][0] for k in chosen]
+            emit(f"Генерирую видео ({' + '.join(names)} параллельно)...", step="video")
+            results: dict[str, dict] = {}
+            lock = threading.Lock()
 
-        if not video_path:
+            def run_prov(name, fn, args):
+                try:
+                    path = fn(*args)
+                    with lock:
+                        results[name] = {"path": path}
+                    emit(f"{name}: готово!", step="video_partial")
+                except Exception as e:
+                    with lock:
+                        results[name] = {"error": str(e)}
+                    emit(f"{name}: {str(e)[:120]}", step="video_error")
+
+            threads = []
+            for pkey in chosen:
+                pname, pfn, pargs = _provider_map[pkey]
+                t = threading.Thread(target=run_prov, args=(pname, pfn, pargs))
+                threads.append(t)
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(timeout=360)
+
+            videos = []
+            for name, res in results.items():
+                if "path" in res:
+                    vid_name = os.path.basename(res["path"])
+                    videos.append({"provider": name, "url": f"/output/{vid_name}"})
+                else:
+                    video_errors.append(f"{name}: {res.get('error', 'unknown')}")
+
+        if not videos:
             raise RuntimeError("Ни одно видео не удалось:\n" + "\n".join(video_errors))
 
-        vid_name = os.path.basename(video_path)
-        videos = [{"provider": video_provider, "url": f"/output/{vid_name}"}]
+        result_provider = ", ".join(v["provider"] for v in videos)
 
         emit(
-            f"Готово! Видео: {video_provider}",
+            f"Готово! Видео: {result_provider}",
             step="done",
             videos=videos,
             video=videos[0]["url"],
-            video_provider=video_provider,
+            video_provider=result_provider,
             errors=video_errors if video_errors else None,
         )
         job["status"] = "done"
@@ -1080,7 +1112,7 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
             "image": f"/output/{img_name}",
             "video": videos[0]["url"],
             "videos": videos,
-            "provider": video_provider,
+            "provider": result_provider,
             "ts": int(time.time() * 1000),
         })
 
@@ -1122,13 +1154,15 @@ def api_generate():
                 mime = detect_mime(data)
                 ref_images.append((data, mime))
 
+    video_provider = request.form.get("video_provider", "veo3").strip()
+
     job_id = uuid.uuid4().hex[:12]
     _jobs[job_id] = {
         "status": "running",
         "queue": queue.Queue(),
     }
 
-    t = threading.Thread(target=_run_job, args=(job_id, idea, ref_images), daemon=True)
+    t = threading.Thread(target=_run_job, args=(job_id, idea, ref_images, video_provider), daemon=True)
     t.start()
 
     return jsonify({"job_id": job_id})

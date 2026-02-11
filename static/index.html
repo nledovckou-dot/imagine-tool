@@ -27,6 +27,12 @@ button.go:disabled { opacity: 0.3; cursor: not-allowed; }
 .btn-row { display: flex; gap: 8px; margin-top: 8px; }
 button.reset { flex: none; padding: 14px 20px; background: transparent; color: #888; border: 1px solid #333; border-radius: 8px; font-size: 14px; cursor: pointer; transition: all 0.2s; }
 button.reset:hover { color: #eee; border-color: #666; }
+.provider-chips { display: flex; gap: 8px; flex-wrap: wrap; }
+.chip { padding: 8px 16px; background: #1a1a1a; border: 1px solid #333; border-radius: 20px; font-size: 13px; cursor: pointer; transition: all 0.2s; color: #aaa; user-select: none; }
+.chip:hover { border-color: #666; color: #eee; }
+.chip.selected { background: #fff; color: #000; border-color: #fff; font-weight: 600; }
+.chip .chip-price { font-size: 11px; color: #888; margin-left: 4px; }
+.chip.selected .chip-price { color: #666; }
 .log { margin-top: 24px; }
 .log-entry { padding: 8px 12px; background: #1a1a1a; border-radius: 6px; margin-bottom: 6px; font-size: 14px; border-left: 3px solid #333; }
 .log-entry.active { border-left-color: #f0c040; }
@@ -75,8 +81,19 @@ button.reset:hover { color: #eee; border-color: #666; }
     <input type="file" id="fileInput" accept="image/*" multiple>
   </div>
 
+  <div class="form-group">
+    <label>Видео AI</label>
+    <div class="provider-chips" id="providerChips">
+      <div class="chip selected" data-provider="veo3" onclick="selectProvider(this)">Veo 3 <span class="chip-price">1080p</span></div>
+      <div class="chip" data-provider="hedra" onclick="selectProvider(this)">Hedra</div>
+      <div class="chip" data-provider="sora" onclick="selectProvider(this)">Sora <span class="chip-price">~$1</span></div>
+      <div class="chip" data-provider="kling" onclick="selectProvider(this)">Kling</div>
+      <div class="chip" data-provider="all" onclick="selectProvider(this)">Все сразу</div>
+    </div>
+  </div>
+
   <div class="btn-row">
-    <button class="go" id="goBtn" onclick="startGeneration()" style="flex:1">Создать картинку + 3 видео</button>
+    <button class="go" id="goBtn" onclick="startGeneration()" style="flex:1">Создать картинку + видео</button>
     <button class="reset" onclick="resetAll()" title="Сбросить всё">Сброс</button>
   </div>
 
@@ -94,7 +111,14 @@ button.reset:hover { color: #eee; border-color: #666; }
 const photoFiles = [];
 const MAX_PHOTOS = 3;
 let history = [];
-let activeES = null; // track active EventSource for reset
+let activeES = null;
+let selectedProvider = 'veo3';
+
+function selectProvider(el) {
+  document.querySelectorAll('.chip').forEach(c => c.classList.remove('selected'));
+  el.classList.add('selected');
+  selectedProvider = el.dataset.provider;
+}
 
 const fileInput = document.getElementById('fileInput');
 const photosArea = document.getElementById('photosArea');
@@ -176,6 +200,7 @@ async function startGeneration() {
 
   const fd = new FormData();
   fd.append('idea', idea);
+  fd.append('video_provider', selectedProvider);
   photoFiles.forEach((f, i) => fd.append('photo' + i, f));
 
   let activeLog = addLog('Отправляю...', 'active');
