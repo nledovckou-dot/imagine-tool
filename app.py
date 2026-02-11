@@ -755,34 +755,38 @@ def generate_hedra_video(image_path: str, text: str) -> str:
     raise RuntimeError("Hedra: таймаут (3 мин)")
 
 
-# ── Veo 3 via FAL.ai (image-to-video) ──
+# ── Veo 3.1 via Google Gemini API (direct, no FAL.ai) ──
 
 def generate_veo3_video(image_path: str, prompt: str) -> str:
-    """Generate video via Google Veo 3 through FAL.ai queue API."""
-    if not _FAL_KEY:
-        raise RuntimeError("FAL_KEY not configured")
+    """Generate video via Google Veo 3.1 through Gemini API (image-to-video)."""
+    if not _GEMINI_KEY:
+        raise RuntimeError("GEMINI_API_KEY not configured")
 
-    # Read image as base64 data URL
-    from PIL import Image
-    import io
-    img = Image.open(image_path).convert("RGB")
-    img.thumbnail((1280, 720), Image.LANCZOS)
-    buf = io.BytesIO()
-    img.save(buf, format="JPEG", quality=85)
-    image_b64 = base64.b64encode(buf.getvalue()).decode()
-    data_url = f"data:image/jpeg;base64,{image_b64}"
+    # Read image as base64
+    with open(image_path, "rb") as f:
+        raw_bytes = f.read()
+    image_b64 = base64.b64encode(raw_bytes).decode()
+    print(f"[veo3] Image: {len(raw_bytes)} bytes", flush=True)
 
-    # Submit to queue
+    # Gemini API base (direct or proxy)
+    base_url = _GEMINI_BASE or "https://generativelanguage.googleapis.com"
+
+    # Submit long-running video generation
     payload = {
-        "image_url": data_url,
-        "prompt": prompt,
+        "instances": [{
+            "prompt": prompt,
+            "image": {"bytesBase64Encoded": image_b64},
+        }],
+        "parameters": {
+            "sampleCount": 1,
+            "aspectRatio": "16:9",
+            "durationSeconds": 8,
+        },
     }
     body = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        f"{_FAL_BASE}/fal-ai/veo3.1/image-to-video",
-        data=body, method="POST",
-    )
-    req.add_header("Authorization", f"Key {_FAL_KEY}")
+    url = f"{base_url}/v1beta/models/veo-3.1-generate-preview:predictLongRunning"
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("x-goog-api-key", _GEMINI_KEY)
     req.add_header("Content-Type", "application/json")
 
     try:
@@ -792,60 +796,61 @@ def generate_veo3_video(image_path: str, prompt: str) -> str:
         err = e.read().decode("utf-8")[:500] if e.fp else ""
         raise RuntimeError(f"Veo3 submit HTTP {e.code}: {err[:200]}") from e
 
-    request_id = result.get("request_id")
-    if not request_id:
-        raise RuntimeError(f"Veo3: no request_id: {result}")
-    print(f"[veo3] Submitted job: {request_id}", flush=True)
+    operation_name = result.get("name")
+    if not operation_name:
+        raise RuntimeError(f"Veo3: no operation name: {result}")
+    print(f"[veo3] Operation: {operation_name}", flush=True)
 
-    # Poll for completion (max 5 min — Veo 3 can be slow)
-    status_url = f"{_FAL_BASE}/fal-ai/veo3.1/image-to-video/requests/{request_id}/status"
-    result_url = f"{_FAL_BASE}/fal-ai/veo3.1/image-to-video/requests/{request_id}"
-
+    # Poll for completion (max 5 min)
     deadline = time.time() + 300
     while time.time() < deadline:
         time.sleep(10)
-        poll_req = urllib.request.Request(status_url, method="GET")
-        poll_req.add_header("Authorization", f"Key {_FAL_KEY}")
+        poll_url = f"{base_url}/v1beta/{operation_name}"
+        poll_req = urllib.request.Request(poll_url, method="GET")
+        poll_req.add_header("x-goog-api-key", _GEMINI_KEY)
         try:
             with urllib.request.urlopen(poll_req, timeout=30) as resp:
                 sr = json.loads(resp.read().decode("utf-8"))
         except urllib.error.HTTPError:
             continue
-        status = sr.get("status", "")
-        if status == "COMPLETED":
-            break
-        if status in ("FAILED", "CANCELLED"):
-            raise RuntimeError(f"Veo3 failed: {sr}")
-        print(f"[veo3] Status: {status}, queue pos: {sr.get('queue_position', '?')}", flush=True)
-    else:
-        raise RuntimeError("Veo3: таймаут (5 мин)")
 
-    # Fetch result
-    res_req = urllib.request.Request(result_url, method="GET")
-    res_req.add_header("Authorization", f"Key {_FAL_KEY}")
-    with urllib.request.urlopen(res_req, timeout=30) as resp:
-        res = json.loads(resp.read().decode("utf-8"))
+        if sr.get("done"):
+            # Extract video URI
+            response = sr.get("response", {})
+            samples = response.get("generateVideoResponse", {}).get("generatedSamples", [])
+            if not samples:
+                raise RuntimeError(f"Veo3: no samples in result: {sr}")
+            video_uri = samples[0].get("video", {}).get("uri", "")
+            if not video_uri:
+                raise RuntimeError(f"Veo3: no video URI: {samples[0]}")
 
-    video_url = res.get("video", {}).get("url", "")
-    if not video_url:
-        raise RuntimeError(f"Veo3: no video URL in result: {res}")
+            # Download video (needs API key for Google-hosted URIs)
+            dl_req = urllib.request.Request(video_uri, method="GET")
+            dl_req.add_header("x-goog-api-key", _GEMINI_KEY)
+            with urllib.request.urlopen(dl_req, timeout=120) as resp:
+                vbytes = resp.read()
 
-    # Download video
-    with urllib.request.urlopen(video_url, timeout=120) as resp:
-        vbytes = resp.read()
-    fpath = os.path.join(_OUTPUT_DIR, f"veo3_{request_id[:12]}.mp4")
-    fd, tmp = tempfile.mkstemp(dir=_OUTPUT_DIR, suffix=".mp4")
-    try:
-        with os.fdopen(fd, "wb") as f:
-            f.write(vbytes)
-        os.replace(tmp, fpath)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
-    return fpath
+            op_short = operation_name.split("/")[-1][:12]
+            fpath = os.path.join(_OUTPUT_DIR, f"veo3_{op_short}.mp4")
+            fd, tmp = tempfile.mkstemp(dir=_OUTPUT_DIR, suffix=".mp4")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(vbytes)
+                os.replace(tmp, fpath)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            return fpath
+
+        if sr.get("error"):
+            raise RuntimeError(f"Veo3 failed: {sr['error'].get('message', sr['error'])}")
+
+        print(f"[veo3] Polling... done={sr.get('done', False)}", flush=True)
+
+    raise RuntimeError("Veo3: таймаут (5 мин)")
 
 
 # ── Background job ──
@@ -928,7 +933,7 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
             providers_list.append("Kling")
         if _HEDRA_KEY:
             providers_list.append("Hedra")
-        if _FAL_KEY:
+        if _GEMINI_KEY:
             providers_list.append("Veo 3")
         if _OPENAI_KEY:
             providers_list.append("Sora")
@@ -955,7 +960,7 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
         if _HEDRA_KEY:
             t = threading.Thread(target=run_provider, args=("Hedra", generate_hedra_video, (video_img, idea)))
             threads.append(t)
-        if _FAL_KEY:
+        if _GEMINI_KEY:
             t = threading.Thread(target=run_provider, args=("Veo 3", generate_veo3_video, (video_img, vid_prompt)))
             threads.append(t)
         if _OPENAI_KEY:
