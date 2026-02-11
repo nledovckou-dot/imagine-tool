@@ -12,3 +12,13 @@ services:
         sync: false
       - key: KLING_SECRET_KEY
         sync: false
+      - key: FAL_KEY
+        sync: false
+      - key: HEDRA_API_KEY
+        sync: false
+      - key: GEMINI_API_KEY
+        sync: false
+      - key: GEMINI_IMAGE_MODEL
+        value: gemini-2.0-flash-exp
+      - key: KREA_API_KEY
+        sync: false

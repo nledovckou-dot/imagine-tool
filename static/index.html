@@ -88,6 +88,7 @@ button.reset:hover { color: #eee; border-color: #666; }
       <div class="chip" data-provider="hedra" onclick="selectProvider(this)">Hedra</div>
       <div class="chip" data-provider="sora" onclick="selectProvider(this)">Sora <span class="chip-price">~$1</span></div>
       <div class="chip" data-provider="kling" onclick="selectProvider(this)">Kling</div>
+      <div class="chip" data-provider="krea" onclick="selectProvider(this)">Krea</div>
       <div class="chip" data-provider="all" onclick="selectProvider(this)">Все сразу</div>
     </div>
   </div>
@@ -118,6 +119,8 @@ const MAX_PHOTOS = 3;
 let history = [];
 let activeES = null;
 let selectedProvider = 'veo3';
+let lastImage = null;
+let lastVidPrompt = null;
 
 function selectProvider(el) {
   document.querySelectorAll('.chip').forEach(c => c.classList.remove('selected'));
@@ -251,9 +254,18 @@ async function startGeneration() {
         return;
       }
 
+      if (ev.step === 'video_retry') {
+        addLog(ev.msg, 'active');
+        return;
+      }
+
       if (ev.step === 'done') {
         addLog(ev.msg || 'Готово!', 'done');
         const r = document.getElementById('result');
+
+        // Store for regen
+        lastImage = ev.image || imageUrl;
+        lastVidPrompt = ev.vid_prompt || '';
 
         // Show all videos in a grid
         if (ev.videos && ev.videos.length > 0) {
@@ -270,7 +282,7 @@ async function startGeneration() {
           r.innerHTML += `<video controls autoplay loop><source src="${ev.video}" type="video/mp4"></video>`;
         }
 
-        // Download row with alternatives
+        // Download row
         let dl = '<div class="download-row">';
         if (imageUrl) dl += `<a href="${imageUrl}" download>Скачать картинку</a>`;
         if (ev.videos) {
@@ -279,14 +291,14 @@ async function startGeneration() {
           }
         }
         dl += '</div>';
-        // Alt services
-        dl += '<div class="download-row" style="margin-top:8px">';
-        dl += '<span style="font-size:12px;color:#666;line-height:32px">Альтернативы:</span>';
-        dl += '<a href="https://hedra.com/app" target="_blank" rel="noopener">Hedra</a>';
-        dl += '<a href="https://sora.com" target="_blank" rel="noopener">Sora</a>';
-        dl += '<a href="https://klingai.com" target="_blank" rel="noopener">Kling</a>';
-        dl += '<a href="https://runwayml.com" target="_blank" rel="noopener">Runway</a>';
-        dl += '<a href="https://www.midjourney.com" target="_blank" rel="noopener">Midjourney</a>';
+        // Regen buttons
+        dl += '<div class="download-row regen-row" style="margin-top:8px">';
+        dl += '<span style="font-size:12px;color:#666;line-height:32px">Перегенерить:</span>';
+        dl += '<a href="#" onclick="regenVideo(\'veo3\'); return false;">Veo 3</a>';
+        dl += '<a href="#" onclick="regenVideo(\'hedra\'); return false;">Hedra</a>';
+        dl += '<a href="#" onclick="regenVideo(\'sora\'); return false;">Sora</a>';
+        dl += '<a href="#" onclick="regenVideo(\'kling\'); return false;">Kling</a>';
+        dl += '<a href="#" onclick="regenVideo(\'krea\'); return false;">Krea</a>';
         dl += '</div>';
         r.innerHTML += dl;
 
@@ -332,6 +344,100 @@ function esc(s) {
   const d = document.createElement('div');
   d.textContent = s;
   return d.innerHTML;
+}
+
+async function regenVideo(provider) {
+  if (!lastImage || !lastVidPrompt) { alert('Нет данных для перегенерации. Сначала создай картинку.'); return; }
+  const password = document.getElementById('password').value;
+  if (!password) { alert('Введи пароль'); return; }
+
+  const btn = document.getElementById('goBtn');
+  btn.disabled = true;
+
+  // Clear log + old videos/regen buttons, keep image
+  document.getElementById('log').innerHTML = '';
+  document.querySelectorAll('.videos-grid, .download-row, .regen-row').forEach(el => el.remove());
+
+  const fd = new FormData();
+  fd.append('image', lastImage);
+  fd.append('vid_prompt', lastVidPrompt);
+  fd.append('provider', provider);
+  fd.append('password', password);
+
+  let activeLog = addLog('Перегенерация видео (' + provider + ')...', 'active');
+
+  try {
+    const resp = await fetch('/api/regen-video', { method: 'POST', body: fd });
+    const data = await resp.json();
+    if (data.error) throw new Error(data.error);
+
+    const jobId = data.job_id;
+    activeLog.remove();
+
+    const es = new EventSource('/api/stream/' + jobId);
+    activeES = es;
+
+    es.onmessage = (e) => {
+      const ev = JSON.parse(e.data);
+      document.querySelectorAll('.log-entry.active').forEach(el => {
+        el.classList.remove('active');
+        el.querySelector('.spinner')?.remove();
+      });
+
+      if (ev.step === 'error') {
+        addLog(ev.msg, 'error');
+        es.close(); activeES = null; btn.disabled = false;
+        return;
+      }
+      if (ev.step === 'video_retry') {
+        addLog(ev.msg, 'active');
+        return;
+      }
+      if (ev.step === 'done') {
+        addLog(ev.msg || 'Готово!', 'done');
+        lastImage = ev.image || lastImage;
+        lastVidPrompt = ev.vid_prompt || lastVidPrompt;
+        const r = document.getElementById('result');
+        // Add new video (keep image)
+        if (ev.videos && ev.videos.length > 0) {
+          let grid = '<div class="videos-grid">';
+          for (const v of ev.videos) {
+            grid += `<div class="video-card">
+              <video controls autoplay loop muted playsinline><source src="${v.url}" type="video/mp4"></video>
+              <div class="video-label"><span>${esc(v.provider)}</span><a href="${v.url}" download>Скачать</a></div>
+            </div>`;
+          }
+          grid += '</div>';
+          r.innerHTML += grid;
+        }
+        // Re-add download + regen buttons
+        let dl = '<div class="download-row">';
+        if (lastImage) dl += `<a href="${lastImage}" download>Скачать картинку</a>`;
+        if (ev.videos) {
+          for (const v of ev.videos) dl += `<a href="${v.url}" download>Скачать ${esc(v.provider)}</a>`;
+        }
+        dl += '</div>';
+        dl += '<div class="download-row regen-row" style="margin-top:8px">';
+        dl += '<span style="font-size:12px;color:#666;line-height:32px">Перегенерить:</span>';
+        dl += '<a href="#" onclick="regenVideo(\'veo3\'); return false;">Veo 3</a>';
+        dl += '<a href="#" onclick="regenVideo(\'hedra\'); return false;">Hedra</a>';
+        dl += '<a href="#" onclick="regenVideo(\'sora\'); return false;">Sora</a>';
+        dl += '<a href="#" onclick="regenVideo(\'kling\'); return false;">Kling</a>';
+        dl += '<a href="#" onclick="regenVideo(\'krea\'); return false;">Krea</a>';
+        dl += '</div>';
+        r.innerHTML += dl;
+
+        es.close(); activeES = null; btn.disabled = false;
+        return;
+      }
+      addLog(ev.msg, 'active');
+    };
+
+    es.onerror = () => { es.close(); activeES = null; btn.disabled = false; };
+  } catch (err) {
+    addLog('Ошибка: ' + err.message, 'error');
+    btn.disabled = false;
+  }
 }
 
 function saveHistory() {

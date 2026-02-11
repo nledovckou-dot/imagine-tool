@@ -31,11 +31,88 @@ _FAL_BASE = "https://queue.fal.run"
 _GEMINI_KEY = os.environ.get("GEMINI_API_KEY", "").strip()
 _GEMINI_BASE = os.environ.get("GEMINI_BASE_URL", "").strip().rstrip("/")
 _GEMINI_MODEL = os.environ.get("GEMINI_IMAGE_MODEL", "gemini-3-pro-image-preview")
+_KREA_KEY = os.environ.get("KREA_API_KEY", "").strip()
+_APP_PUBLIC_URL = (os.environ.get("APP_PUBLIC_URL") or os.environ.get("RENDER_EXTERNAL_URL") or "").strip().rstrip("/")
 _YANDEX_API_KEY = os.environ.get("YANDEX_GPT_API_KEY", "").strip()
 _YANDEX_FOLDER = os.environ.get("YANDEX_FOLDER_ID", "").strip()
 _APP_PASSWORD = os.environ.get("APP_PASSWORD", "123321")
+_TG_ALERT_TOKEN = os.environ.get("IMAGINE_BOT_TOKEN", "").strip()
+_TG_ALERT_CHAT_IDS = [
+    c.strip() for c in os.environ.get("TG_ADMIN_USER_ID", "").split(",") if c.strip()
+]
 _OUTPUT_DIR = os.path.join(os.path.dirname(__file__), "output")
 os.makedirs(_OUTPUT_DIR, exist_ok=True)
+
+# ── Brute-force protection ──
+
+_MAX_ATTEMPTS = 5
+_LOCKOUT_SEC = 60
+_login_attempts: dict[str, list[float]] = {}   # IP → failed timestamps
+_login_lockout: dict[str, float] = {}           # IP → locked until
+_login_lock = threading.Lock()
+
+
+def _check_login(ip: str) -> tuple[bool, str]:
+    """Check if IP is allowed to attempt login."""
+    with _login_lock:
+        now = time.time()
+        if ip in _login_lockout and now < _login_lockout[ip]:
+            remaining = int(_login_lockout[ip] - now)
+            return False, f"Слишком много попыток. Подожди {remaining} сек."
+        # Clear expired lockout
+        if ip in _login_lockout and now >= _login_lockout[ip]:
+            _login_lockout.pop(ip, None)
+            _login_attempts.pop(ip, None)
+        return True, ""
+
+
+def _record_fail(ip: str) -> int:
+    """Record failed attempt. Returns attempts left. Triggers lockout + TG alert at limit."""
+    with _login_lock:
+        now = time.time()
+        if ip not in _login_attempts:
+            _login_attempts[ip] = []
+        _login_attempts[ip] = [t for t in _login_attempts[ip] if now - t < 300]
+        _login_attempts[ip].append(now)
+        count = len(_login_attempts[ip])
+        if count >= _MAX_ATTEMPTS:
+            _login_lockout[ip] = now + _LOCKOUT_SEC
+            _login_attempts[ip] = []
+            threading.Thread(
+                target=_send_tg_alert,
+                args=(f"⚠️ Imagine Tool: {_MAX_ATTEMPTS} неудачных попыток входа с IP {ip}. "
+                      f"Заблокирован на {_LOCKOUT_SEC} сек.",),
+                daemon=True,
+            ).start()
+            return 0
+        return _MAX_ATTEMPTS - count
+
+
+def _record_success(ip: str):
+    """Clear attempts on successful login."""
+    with _login_lock:
+        _login_attempts.pop(ip, None)
+        _login_lockout.pop(ip, None)
+
+
+def _send_tg_alert(text: str):
+    """Send alert to all admin TG chats."""
+    if not _TG_ALERT_TOKEN or not _TG_ALERT_CHAT_IDS:
+        print(f"[alert] No TG config: {text}", flush=True)
+        return
+    for chat_id in _TG_ALERT_CHAT_IDS:
+        try:
+            payload = json.dumps({"chat_id": chat_id, "text": text}).encode()
+            req = urllib.request.Request(
+                f"https://api.telegram.org/bot{_TG_ALERT_TOKEN}/sendMessage",
+                data=payload, method="POST",
+            )
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                resp.read()
+            print(f"[alert] Sent to {chat_id}", flush=True)
+        except Exception as e:
+            print(f"[alert] TG send failed ({chat_id}): {e}", flush=True)
 
 # ── Rate limiter for Gemini free tier ──
 
@@ -109,6 +186,123 @@ class CircuitBreaker:
 
 _breaker = CircuitBreaker(max_failures=3, cooldown_sec=300)
 
+# ── Provider requirements (pre-validation) ──
+
+_PROVIDER_REQS = {
+    "sora":  {"w": 1280, "h": 720,  "max_prompt": 4000},
+    "kling": {"w": 1920, "h": 1080, "max_prompt": 2500},
+    "hedra": {"w": 1920, "h": 1080, "max_prompt": 2000},
+    "veo3":  {"w": 1920, "h": 1080, "max_prompt": 5000},
+    "krea":  {"w": 1280, "h": 720,  "max_prompt": 4000},
+}
+
+_RU_VIDEO_SUFFIX = (
+    "\n\nКРИТИЧЕСКИ ВАЖНО: ВСЕ надписи, титры, слоганы, субтитры, текст на экране — "
+    "СТРОГО НА РУССКОМ ЯЗЫКЕ (кириллица). Речь и голос — на русском языке. "
+    "ЗАПРЕЩЕНО использовать английский язык, латиницу или любые другие языки. "
+    "Язык видео: РУССКИЙ. "
+    "Люди в видео — соответствуют контексту рекламы (если детский лагерь — дети, "
+    "если фитнес — спортивные взрослые и т.д.). Внешность людей — славянская/европейская "
+    "(реклама для России). "
+    "Никаких выдуманных логотипов — только реальные бренды с исходного фото."
+)
+
+
+def _moderation_prescreen(prompt: str) -> str:
+    """Check prompt via Gemini Flash and auto-fix moderation issues. Returns cleaned prompt."""
+    if not _GEMINI_KEY:
+        return prompt
+    base_url = _GEMINI_BASE or "https://generativelanguage.googleapis.com"
+    url = f"{base_url}/v1beta/models/gemini-2.0-flash:generateContent"
+    system_msg = (
+        "Ты — модератор контента для AI-генерации картинок и видео.\n"
+        "Проверь промпт и исправь ТОЛЬКО реально опасные элементы:\n\n"
+        "ИСПРАВЛЯТЬ (заблокирует модерация):\n"
+        "- насилие, кровь, оружие → динамичное действие без крови\n"
+        "- нагота, сексуальный контент → убрать\n"
+        "- известные реальные люди → безымянные стильные персонажи\n"
+        "- медицинские процедуры крупно → общий план\n\n"
+        "НЕ ТРОГАТЬ (это безопасно и пройдёт модерацию):\n"
+        "- Дети в безопасном контексте (лагерь, школа, спорт, семья, игры) — "
+        "это НОРМАЛЬНО, НЕ заменяй на взрослых!\n"
+        "- Еда, напитки, продукты\n"
+        "- Спорт, активный отдых\n\n"
+        "ВАЖНО: Сохраняй культурный контекст. Если промпт на русском — "
+        "люди должны выглядеть как жители России (славянская внешность).\n\n"
+        "Если промпт безопасен — верни его БЕЗ ИЗМЕНЕНИЙ.\n"
+        "Отвечай ТОЛЬКО текстом промпта, без пояснений."
+    )
+    payload = {
+        "system_instruction": {"parts": [{"text": system_msg}]},
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"maxOutputTokens": 2048},
+    }
+    headers = {"x-goog-api-key": _GEMINI_KEY, "Content-Type": "application/json"}
+    try:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        parts = body.get("candidates", [{}])[0].get("content", {}).get("parts", [])
+        cleaned = "".join(p.get("text", "") for p in parts).strip()
+        if cleaned and len(cleaned) > 50:
+            if cleaned != prompt:
+                print(f"[moderation] Prompt auto-fixed ({len(prompt)}→{len(cleaned)} chars)", flush=True)
+            return cleaned
+    except Exception as e:
+        print(f"[moderation] Prescreen failed: {e}, using original prompt", flush=True)
+    return prompt
+
+
+def _check_provider_balance(provider: str) -> tuple[bool, str]:
+    """Check if provider has enough credits. Returns (available, reason)."""
+    try:
+        if provider == "kling":
+            token = _kling_jwt()
+            req = urllib.request.Request("https://api.klingai.com/v1/account/credits", method="GET")
+            req.add_header("Authorization", f"Bearer {token}")
+            req.add_header("Content-Type", "application/json")
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            balance = data.get("data", {}).get("balance", 0)
+            if balance <= 0:
+                return False, f"Kling баланс: {balance}"
+            return True, ""
+        elif provider == "hedra":
+            credits_resp = _hedra_request("GET", "/billing/credits")
+            remaining = credits_resp.get("remaining", 0)
+            if remaining < 24:  # MiniMax costs 24 (cheapest)
+                return False, f"Hedra кредиты: {remaining} (нужно минимум 24)"
+            return True, ""
+        elif provider == "krea":
+            # Krea doesn't have a balance check endpoint, just try
+            return True, ""
+    except Exception:
+        pass
+    return True, ""  # If check fails, try anyway
+
+
+def _try_with_retry(fn, args, name: str, emit_fn, max_retries: int = 1) -> str:
+    """Try video provider with retry on transient errors. Returns file path or raises."""
+    last_err = None
+    for attempt in range(max_retries + 1):
+        try:
+            return fn(*args)
+        except RuntimeError as e:
+            last_err = e
+            err_lower = str(e).lower()
+            # Non-retryable — stop immediately
+            if any(x in err_lower for x in [
+                "not configured", "balance", "insufficient", "credits", "quota",
+            ]):
+                raise
+            if attempt < max_retries:
+                wait = 5 * (attempt + 1)
+                emit_fn(f"{name}: ошибка ({str(e)[:60]}), повтор #{attempt+2} через {wait}с...", step="video_retry")
+                time.sleep(wait)
+    raise last_err
+
+
 # ── Job tracking ──
 
 _jobs: dict[str, dict] = {}  # job_id → {status, progress_queue, result, ...}
@@ -166,12 +360,32 @@ _BRIEF_SYSTEM = (
     "— Сохраняй ТОЧНЫЕ цвета бренда, форму продукта, логотип, упаковку.\n"
     "— Не выдумывай новый дизайн — используй то, что на фото.\n"
     "— Это реклама для конечного потребителя с ГОТОВЫМ продуктом.\n"
-    "— Опиши продукт с фото максимально точно: цвет, форма, текст на упаковке.\n\n"
+    "— Опиши продукт с фото максимально точно: цвет, форма, текст на упаковке.\n"
+    "— НИКОГДА не выдумывай логотипы, бренды, торговые марки, которых нет на фото.\n"
+    "— Если на фото НЕТ логотипа — НЕ добавляй никакой логотип.\n"
+    "— Если на фото ЕСТЬ логотип — используй ТОЛЬКО его, точно как на фото.\n\n"
+    "ВАЖНЕЙШЕЕ ПРАВИЛО — КОНТЕКСТ И КУЛЬТУРА:\n"
+    "— СТРОГО следуй контексту запроса клиента. Если реклама про детский лагерь — "
+    "показывай детей. Если про фитнес — показывай спортивных людей. НЕ заменяй "
+    "целевую аудиторию на другую.\n"
+    "— Если текст на русском языке — это реклама для России. "
+    "Люди должны выглядеть как жители России: славянская/европейская внешность, "
+    "светлая кожа, русые/тёмные волосы. НЕ генерируй случайную этничность.\n"
+    "— Обстановка, архитектура, природа — российская (если не указано иное).\n"
+    "— Если клиент упоминает конкретный город/регион — используй его культуру.\n\n"
+    "ПРАВИЛА МОДЕРАЦИИ (для прохождения модерации AI-систем):\n"
+    "— ЗАПРЕЩЕНО: насилие, оружие, кровь, наготу, сексуальный контент.\n"
+    "— ЗАПРЕЩЕНО: известные реальные люди (политики, звёзды) без разрешения.\n"
+    "— ЗАПРЕЩЕНО: медицинские процедуры крупным планом, шприцы, операции.\n"
+    "— ЗАПРЕЩЕНО: религиозные символы в коммерческом/неуважительном контексте.\n"
+    "— Дети в рекламе РАЗРЕШЕНЫ, если контекст безопасный (образование, спорт, "
+    "отдых, семья). Показывай детей в АКТИВНОСТИ: бегают, учатся, играют. "
+    "Избегай крупных планов лиц детей — лучше общие/средние планы групп.\n\n"
     "ТВОЯ ЗАДАЧА — обогатить идею клиента контекстом:\n"
     "— Если упомянуто МЕСТО — добавь культуру, архитектуру, символы, природу.\n"
     "— Если упомянут ПРОДУКТ — покажи его в контексте: люди, эмоции, стиль жизни.\n"
     "— Если упомянута ТЕМА — раскрой атмосферу, субкультуру, детали.\n"
-    "— Всегда добавляй ЛЮДЕЙ, АКТИВНОСТЬ, ЭМОЦИИ.\n\n"
+    "— Добавляй ЛЮДЕЙ, АКТИВНОСТЬ, ЭМОЦИИ — соответствующих контексту запроса.\n\n"
     "ПРОМПТ 1 — КАРТИНКА:\n"
     "  Ключевой рекламный кадр. Премиальная эстетика.\n"
     "  Композиция, цвета, свет, текстуры, настроение.\n"
@@ -186,6 +400,10 @@ _BRIEF_SYSTEM = (
     "  — 6-8 сек: финал, продукт крупно, слоган НА РУССКОМ\n"
     "  Если есть референсы — продукт должен выглядеть ТОЧНО как на фото.\n"
     "  Движение камеры, свет, атмосфера, цветовая палитра.\n"
+    "  ОБЯЗАТЕЛЬНО ВКЛЮЧИ В ПРОМПТ ФРАЗУ: «Все надписи, титры и текст на экране "
+    "написаны НА РУССКОМ ЯЗЫКЕ кириллицей. Язык видео: русский.»\n"
+    "  Это КРИТИЧЕСКИ важно — видео-модели по умолчанию генерируют английский текст, "
+    "поэтому русский язык нужно указать ЯВНО в промпте.\n"
     "  1000–2000 символов.\n\n"
     "ФОРМАТ ОТВЕТА (строго):\n"
     "КАРТИНКА: [промпт на русском]\n"
@@ -717,8 +935,10 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
     image_b64 = base64.b64encode(raw_bytes).decode()
     print(f"[kling] Image: {image_path}, size={len(raw_bytes)} bytes, b64={len(image_b64)} chars", flush=True)
 
-    # v2-master supports 5 or 10 sec
-    if duration_sec not in (5, 10):
+    # Kling v2: 5 or 10 sec
+    if duration_sec < 5:
+        duration_sec = 5
+    if duration_sec > 10:
         duration_sec = 10
     # Kling API accepts raw base64 or URL (NOT data URI with prefix)
     body_data = {
@@ -799,6 +1019,14 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
 _HEDRA_API = "https://api.hedra.com/web-app/public"
 _HEDRA_VIDEO_MODEL = os.environ.get("HEDRA_VIDEO_MODEL", "fb657777-6b02-478d-87a9-e02e8c53748c")  # Veo 3 I2V
 
+# Per-model valid durations (from /models API)
+_HEDRA_DURATIONS = {
+    "fb657777": 8000,   # Veo 3: 4000/6000/8000
+    "9963e814": 8000,   # Veo 3 Fast: 4000/6000/8000
+    "b917e7da": 6000,   # MiniMax Hailuo: 6000/10000
+    "0e451fde": 5000,   # Kling 2.5 Turbo: 5000/10000
+}
+
 
 def _hedra_request(method: str, path: str, body: Optional[dict] = None, timeout: int = 60) -> dict:
     """Make authenticated JSON request to Hedra API."""
@@ -863,8 +1091,54 @@ def generate_hedra_video(image_path: str, text: str) -> str:
     print(f"[hedra] Uploading keyframe: {image_path}", flush=True)
     image_id = _hedra_upload_image(image_path)
 
-    # Create video generation (official format from hedra-api-starter)
+    # Create video generation — auto-select model based on available credits
     model_id = os.environ.get("_HEDRA_MODEL_OVERRIDE", _HEDRA_VIDEO_MODEL)
+
+    # If no override, check credits and pick affordable model
+    if not os.environ.get("_HEDRA_MODEL_OVERRIDE"):
+        try:
+            credits_resp = _hedra_request("GET", "/billing/credits")
+            remaining = credits_resp.get("remaining", 9999)
+            # Model costs: Veo3=440, Veo3Fast=160, Kling=50, MiniMax=24
+            _MODEL_COSTS = [
+                ("fb657777", 440),  # Veo 3
+                ("9963e814", 160),  # Veo 3 Fast
+                ("0e451fde", 50),   # Kling 2.5 Turbo
+                ("b917e7da", 24),   # MiniMax Hailuo
+            ]
+            for mid_prefix, cost in _MODEL_COSTS:
+                if model_id.startswith(mid_prefix) and remaining < cost:
+                    # Current model too expensive, downgrade
+                    for alt_prefix, alt_cost in _MODEL_COSTS:
+                        if remaining >= alt_cost:
+                            full_id = next(
+                                (f"{p}-{_HEDRA_VIDEO_MODEL.split('-', 1)[1]}" for p in [alt_prefix]),
+                                None,
+                            )
+                            # Find full ID from HEDRA_DURATIONS keys
+                            for dur_prefix in _HEDRA_DURATIONS:
+                                if dur_prefix.startswith(alt_prefix):
+                                    break
+                            # Use the cheapest affordable model from known IDs
+                            _CHEAP_MODELS = {
+                                "b917e7da": "b917e7da-f0a4-42d1-b52f-67ee11569cc8",
+                                "0e451fde": "0e451fde-9e6f-48e6-83a9-222f6cc05eba",
+                                "9963e814": "9963e814-d1ee-4518-a844-7ed380ddbb20",
+                                "fb657777": "fb657777-6b02-478d-87a9-e02e8c53748c",
+                            }
+                            model_id = _CHEAP_MODELS.get(alt_prefix, model_id)
+                            print(f"[hedra] Credits={remaining}, auto-downgraded to {alt_prefix} (cost={alt_cost})", flush=True)
+                            break
+                    break
+        except Exception:
+            pass  # If credits check fails, proceed with default
+
+    # Pick valid duration for this model
+    duration = 8000
+    for prefix, dur in _HEDRA_DURATIONS.items():
+        if model_id.startswith(prefix):
+            duration = dur
+            break
     payload = {
         "type": "video",
         "ai_model_id": model_id,
@@ -873,7 +1147,7 @@ def generate_hedra_video(image_path: str, text: str) -> str:
             "text_prompt": text[:2000],
             "resolution": "720p",
             "aspect_ratio": "16:9",
-            "duration_ms": 8000,
+            "duration_ms": duration,
         },
         "batch_size": 1,
     }
@@ -988,9 +1262,16 @@ def generate_veo3_video(image_path: str, prompt: str) -> str:
         if sr.get("done"):
             # Extract video URI
             response = sr.get("response", {})
-            samples = response.get("generateVideoResponse", {}).get("generatedSamples", [])
+            gen_resp = response.get("generateVideoResponse", {})
+            # Check for content moderation filter
+            rai_reasons = gen_resp.get("raiMediaFilteredReasons", [])
+            if rai_reasons:
+                raise RuntimeError(f"Veo3 модерация: {'; '.join(rai_reasons)}")
+            if gen_resp.get("raiMediaFilteredCount"):
+                raise RuntimeError("Veo3: контент заблокирован модерацией (дети, насилие и т.д.)")
+            samples = gen_resp.get("generatedSamples", [])
             if not samples:
-                raise RuntimeError(f"Veo3: no samples in result: {sr}")
+                raise RuntimeError(f"Veo3: нет результата: {sr}")
             video_uri = samples[0].get("video", {}).get("uri", "")
             if not video_uri:
                 raise RuntimeError(f"Veo3: no video URI: {samples[0]}")
@@ -1022,6 +1303,105 @@ def generate_veo3_video(image_path: str, prompt: str) -> str:
         print(f"[veo3] Polling... done={sr.get('done', False)}", flush=True)
 
     raise RuntimeError("Veo3: таймаут (5 мин)")
+
+
+# ── Krea AI (aggregator: Veo, Kling, Hailuo, Wan — all via one API) ──
+
+def generate_krea_video(image_path: str, prompt: str, duration: int = 6) -> str:
+    """Generate video via Krea AI image-to-video API (MiniMax Hailuo)."""
+    if not _KREA_KEY:
+        raise RuntimeError("KREA_API_KEY not configured")
+    if not _APP_PUBLIC_URL:
+        raise RuntimeError("APP_PUBLIC_URL not configured (Krea needs public image URL)")
+
+    img_name = os.path.basename(image_path)
+    image_url = f"{_APP_PUBLIC_URL}/output/{img_name}"
+
+    # MiniMax Hailuo via Krea: only 6 or 10 allowed (API enum)
+    if duration >= 8:
+        duration = 10
+    else:
+        duration = 6
+
+    payload = {
+        "startImage": image_url,
+        "prompt": prompt[:4000],
+        "duration": duration,
+    }
+    data = json.dumps(payload).encode("utf-8")
+    url = "https://api.krea.ai/generate/video/minimax/hailuo-2.3"
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("Authorization", f"Bearer {_KREA_KEY}")
+    req.add_header("Content-Type", "application/json")
+    req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+    req.add_header("Accept", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8")[:500] if e.fp else ""
+        raise RuntimeError(f"Krea API HTTP {e.code}: {err[:200]}") from e
+
+    # Krea returns generation object with id
+    job_id = result.get("id") or result.get("job_id")
+    if not job_id:
+        raise RuntimeError(f"Krea: no job id: {json.dumps(result)[:300]}")
+    print(f"[krea] Job: {job_id}", flush=True)
+
+    # Poll for completion (max 5 min)
+    deadline = time.time() + 300
+    while time.time() < deadline:
+        time.sleep(8)
+        poll_url = f"https://api.krea.ai/jobs/{job_id}"
+        poll_req = urllib.request.Request(poll_url, method="GET")
+        poll_req.add_header("Authorization", f"Bearer {_KREA_KEY}")
+        poll_req.add_header("User-Agent", "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36")
+        try:
+            with urllib.request.urlopen(poll_req, timeout=30) as resp:
+                sr = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError:
+            continue
+
+        status = sr.get("status", "")
+        if status in ("completed", "succeeded") or (sr.get("completed_at") and status != "failed"):
+            # Krea returns result.urls[] array
+            result_obj = sr.get("result") or {}
+            urls = result_obj.get("urls") or []
+            video_url = urls[0] if urls else ""
+            # Fallback: try other shapes
+            if not video_url:
+                video_url = (
+                    result_obj.get("video_url", "")
+                    or sr.get("video_url", "")
+                    or sr.get("url", "")
+                )
+            if not video_url:
+                raise RuntimeError(f"Krea: no video_url in response: {json.dumps(sr)[:400]}")
+            with urllib.request.urlopen(video_url, timeout=120) as vr:
+                vbytes = vr.read()
+            fpath = os.path.join(_OUTPUT_DIR, f"krea_{str(job_id)[:12]}.mp4")
+            fd, tmp = tempfile.mkstemp(dir=_OUTPUT_DIR, suffix=".mp4")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    f.write(vbytes)
+                os.replace(tmp, fpath)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            print(f"[krea] Downloaded: {fpath} ({len(vbytes)} bytes)", flush=True)
+            return fpath
+
+        if status == "failed":
+            err_msg = sr.get("error", sr.get("message", str(sr)))
+            raise RuntimeError(f"Krea failed: {err_msg}")
+
+        print(f"[krea] Polling... status={status}", flush=True)
+
+    raise RuntimeError("Krea: таймаут (5 мин)")
 
 
 # ── Background job ──
@@ -1069,6 +1449,15 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
         emit(f"Бриф готов ({brief_source})", step="gpt_done", img_prompt=img_prompt, vid_prompt=vid_prompt)
 
         # 2. Image (Gemini FREE → DALL-E → Flux)
+        # Add moderation suffix to image prompt to prevent content policy violations
+        _IMG_MODERATION = (
+            "\n\nВАЖНО: Люди на картинке соответствуют контексту рекламы "
+            "(если реклама для детей — показывай детей, если для взрослых — взрослых). "
+            "Внешность людей — славянская/европейская (реклама для российского рынка). "
+            "Никаких выдуманных логотипов или брендов — только то, что есть в описании."
+        )
+        img_prompt_safe = img_prompt + _IMG_MODERATION
+
         img_path = None
         img_source = ""
 
@@ -1076,7 +1465,7 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
         if _GEMINI_KEY and not _breaker.is_open("gemini_image"):
             try:
                 emit("Генерирую картинку (Gemini)...", step="dalle")
-                img_path = generate_gemini_image(img_prompt)
+                img_path = generate_gemini_image(img_prompt_safe)
                 img_source = "Gemini"
             except Exception as gemini_err:
                 emit(f"Gemini: {str(gemini_err)[:100]}. Пробую DALL-E...", step="dalle_fallback")
@@ -1084,7 +1473,7 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
         if not img_path and _OPENAI_KEY:
             try:
                 emit("Генерирую картинку (DALL-E 3 HD)...", step="dalle")
-                img_path = generate_dalle(img_prompt)
+                img_path = generate_dalle(img_prompt_safe)
                 img_source = "DALL-E"
             except Exception as dalle_err:
                 emit(f"DALL-E: {str(dalle_err)[:100]}. Пробую Flux...", step="dalle_fallback")
@@ -1092,7 +1481,7 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
         if not img_path and _FAL_KEY:
             try:
                 emit("Генерирую картинку (Flux Pro)...", step="dalle")
-                img_path = generate_flux_image(img_prompt)
+                img_path = generate_flux_image(img_prompt_safe)
                 img_source = "Flux"
             except Exception as flux_err:
                 emit(f"Flux: {str(flux_err)[:100]}", step="dalle_fallback")
@@ -1102,11 +1491,33 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
         img_name = os.path.basename(img_path)
         emit(f"Картинка готова ({img_source})!", step="dalle_done", image=f"/output/{img_name}")
 
-        # 3. Resize for video (1080p)
-        video_img = resize_for_video(img_path, 1920, 1080)
+        # 3. Moderation prescreen + Russian language + per-provider image resize
+        emit("Проверяю промпт на модерацию...", step="moderation")
+        vid_prompt_clean = _moderation_prescreen(vid_prompt)
+        vid_prompt_ru = vid_prompt_clean + _RU_VIDEO_SUFFIX
 
-        # 4. Video — with auto-fallback chain
-        # Hedra model IDs for fallback (cheapest first)
+        # Pre-validate: resize per provider requirements (cache unique sizes)
+        _resized_cache: dict[tuple[int,int], str] = {}
+        def _get_resized(w: int, h: int) -> str:
+            key = (w, h)
+            if key not in _resized_cache:
+                _resized_cache[key] = resize_for_video(img_path, w, h)
+            return _resized_cache[key]
+
+        # Build provider args with correct sizes and prompt limits
+        def _build_args(pkey: str) -> tuple:
+            reqs = _PROVIDER_REQS.get(pkey, {"w": 1920, "h": 1080, "max_prompt": 4000})
+            img = _get_resized(reqs["w"], reqs["h"])
+            prompt = vid_prompt_ru[:reqs["max_prompt"]]
+            if pkey == "sora":
+                return (img, prompt, 8)
+            elif pkey == "kling":
+                return (img, prompt, 10)
+            elif pkey == "krea":
+                return (img, prompt, 8)
+            return (img, prompt)
+
+        # 4. Video — with auto-fallback chain + retry
         _HEDRA_MODELS = {
             "hedra": ("fb657777-6b02-478d-87a9-e02e8c53748c", "Hedra Veo3"),
             "hedra_minimax": ("b917e7da-f0a4-42d1-b52f-67ee11569cc8", "Hedra MiniMax"),
@@ -1115,7 +1526,6 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
         }
 
         def _hedra_with_model(model_id: str, img: str, prompt: str) -> str:
-            """Generate video via Hedra with a specific model."""
             old_model = os.environ.get("_HEDRA_MODEL_OVERRIDE")
             os.environ["_HEDRA_MODEL_OVERRIDE"] = model_id
             try:
@@ -1126,26 +1536,41 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
                 else:
                     os.environ.pop("_HEDRA_MODEL_OVERRIDE", None)
 
-        # Provider map: key → (display_name, function, args)
-        _provider_map = {
-            "veo3": ("Veo 3", generate_veo3_video, (video_img, vid_prompt)),
-            "hedra": ("Hedra", generate_hedra_video, (video_img, vid_prompt)),
-            "sora": ("Sora", generate_sora_video, (video_img, vid_prompt, 8)),
-            "kling": ("Kling", generate_kling_video, (video_img, vid_prompt, 10)),
+        # Provider map: key → (display_name, function)
+        _provider_fns = {
+            "veo3": ("Veo 3", generate_veo3_video),
+            "hedra": ("Hedra", generate_hedra_video),
+            "sora": ("Sora", generate_sora_video),
+            "kling": ("Kling", generate_kling_video),
+            "krea": ("Krea", generate_krea_video),
         }
+        _provider_map = {}
+        for _pk, (_pn, _pfn) in _provider_fns.items():
+            _provider_map[_pk] = (_pn, _pfn, _build_args(_pk))
         _provider_available = {
             "veo3": bool(_GEMINI_KEY),
             "hedra": bool(_HEDRA_KEY),
             "sora": bool(_OPENAI_KEY),
             "kling": bool(_KLING_ACCESS and _KLING_SECRET),
+            "krea": bool(_KREA_KEY and _APP_PUBLIC_URL),
         }
+
+        # Pre-flight balance checks — skip providers with 0 credits
+        for _bpk in list(_provider_available.keys()):
+            if _provider_available[_bpk]:
+                ok, reason = _check_provider_balance(_bpk)
+                if not ok:
+                    _provider_available[_bpk] = False
+                    emit(f"{_bpk}: пропущен ({reason})", step="balance_check")
+                    print(f"[balance] {_bpk} skipped: {reason}", flush=True)
 
         # Fallback chains: if primary fails, try these next
         _fallback_chain = {
-            "veo3": ["hedra", "hedra_veo3fast", "sora"],
-            "hedra": ["hedra_minimax", "hedra_kling", "hedra_veo3fast", "veo3"],
-            "sora": ["hedra", "hedra_veo3fast", "veo3"],
-            "kling": ["hedra_kling", "hedra", "hedra_minimax"],
+            "veo3": ["hedra", "hedra_veo3fast", "krea", "sora"],
+            "hedra": ["hedra_minimax", "hedra_kling", "hedra_veo3fast", "krea", "veo3"],
+            "sora": ["hedra", "hedra_veo3fast", "krea", "veo3"],
+            "kling": ["hedra_kling", "hedra", "hedra_minimax", "krea"],
+            "krea": ["hedra", "hedra_minimax", "veo3", "sora"],
         }
 
         if video_provider == "all":
@@ -1165,11 +1590,11 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
             pname, pfn, pargs = _provider_map[pkey]
             videos = []
 
-            # Try primary
+            # Try primary with retry
             if not _breaker.is_open(pkey):
                 emit(f"Генерирую видео ({pname})...", step="video")
                 try:
-                    vpath = pfn(*pargs)
+                    vpath = _try_with_retry(pfn, pargs, pname, emit, max_retries=1)
                     vid_name = os.path.basename(vpath)
                     videos = [{"provider": pname, "url": f"/output/{vid_name}"}]
                     _breaker.record_success(pkey)
@@ -1188,9 +1613,13 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
                         continue
                     if fb_key in _HEDRA_MODELS:
                         model_id, fb_name = _HEDRA_MODELS[fb_key]
+                        hedra_args = _build_args("hedra")
                         emit(f"Пробую {fb_name}...", step="video")
                         try:
-                            vpath = _hedra_with_model(model_id, video_img, vid_prompt)
+                            vpath = _try_with_retry(
+                                _hedra_with_model, (model_id, hedra_args[0], hedra_args[1]),
+                                fb_name, emit, max_retries=1,
+                            )
                             vid_name = os.path.basename(vpath)
                             videos = [{"provider": fb_name, "url": f"/output/{vid_name}"}]
                             _breaker.record_success(fb_key)
@@ -1203,7 +1632,7 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
                         fb_name, fb_fn, fb_args = _provider_map[fb_key]
                         emit(f"Пробую {fb_name}...", step="video")
                         try:
-                            vpath = fb_fn(*fb_args)
+                            vpath = _try_with_retry(fb_fn, fb_args, fb_name, emit, max_retries=1)
                             vid_name = os.path.basename(vpath)
                             videos = [{"provider": fb_name, "url": f"/output/{vid_name}"}]
                             _breaker.record_success(fb_key)
@@ -1221,7 +1650,7 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
 
             def run_prov(name, fn, args):
                 try:
-                    path = fn(*args)
+                    path = _try_with_retry(fn, args, name, emit, max_retries=1)
                     with lock:
                         results[name] = {"path": path}
                     emit(f"{name}: готово!", step="video_partial")
@@ -1259,6 +1688,8 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
             videos=videos,
             video=videos[0]["url"],
             video_provider=result_provider,
+            image=f"/output/{img_name}",
+            vid_prompt=vid_prompt,
             errors=video_errors if video_errors else None,
         )
         job["status"] = "done"
@@ -1282,6 +1713,69 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]], video_
         q.put(None)  # signal end
 
 
+# ── Video-only regen job ──
+
+def _run_regen_job(job_id: str, img_path: str, vid_prompt: str, provider: str):
+    """Re-generate video only (skip brief + image)."""
+    job = _jobs[job_id]
+    q: queue.Queue = job["queue"]
+
+    def emit(msg: str, **extra):
+        q.put({"msg": msg, **extra})
+
+    try:
+        vid_prompt_clean = _moderation_prescreen(vid_prompt)
+        vid_prompt_ru = vid_prompt_clean if _RU_VIDEO_SUFFIX in vid_prompt_clean else vid_prompt_clean + _RU_VIDEO_SUFFIX
+
+        _provider_fns = {
+            "veo3": ("Veo 3", generate_veo3_video),
+            "hedra": ("Hedra", generate_hedra_video),
+            "sora": ("Sora", generate_sora_video),
+            "kling": ("Kling", generate_kling_video),
+            "krea": ("Krea", generate_krea_video),
+        }
+
+        if provider not in _provider_fns:
+            raise RuntimeError(f"Неизвестный провайдер: {provider}")
+
+        pname, pfn = _provider_fns[provider]
+        reqs = _PROVIDER_REQS.get(provider, {"w": 1920, "h": 1080, "max_prompt": 4000})
+        resized = resize_for_video(img_path, reqs["w"], reqs["h"])
+        prompt = vid_prompt_ru[:reqs["max_prompt"]]
+
+        if provider == "sora":
+            args = (resized, prompt, 8)
+        elif provider == "kling":
+            args = (resized, prompt, 10)
+        elif provider == "krea":
+            args = (resized, prompt, 8)
+        else:
+            args = (resized, prompt)
+
+        emit(f"Генерирую видео ({pname})...", step="video")
+        vpath = _try_with_retry(pfn, args, pname, emit, max_retries=1)
+        vid_name = os.path.basename(vpath)
+        img_name = os.path.basename(img_path)
+
+        videos = [{"provider": pname, "url": f"/output/{vid_name}"}]
+        emit(
+            f"Готово! Видео: {pname}",
+            step="done",
+            videos=videos,
+            video=videos[0]["url"],
+            video_provider=pname,
+            image=f"/output/{img_name}",
+            vid_prompt=vid_prompt,
+        )
+        job["status"] = "done"
+
+    except Exception as exc:
+        emit(f"Ошибка: {exc}", step="error")
+        job["status"] = "error"
+    finally:
+        q.put(None)
+
+
 # ── Routes ──
 
 @app.route("/")
@@ -1296,10 +1790,23 @@ def serve_output(filename):
 
 @app.route("/api/generate", methods=["POST"])
 def api_generate():
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
+    ip = ip.split(",")[0].strip()  # first IP if behind proxy
+
+    # Brute-force check
+    allowed, reason = _check_login(ip)
+    if not allowed:
+        return jsonify({"error": reason}), 429
+
     # Password check
     password = request.form.get("password", "").strip()
     if password != _APP_PASSWORD:
-        return jsonify({"error": "Неверный пароль"}), 403
+        left = _record_fail(ip)
+        if left <= 0:
+            return jsonify({"error": f"Неверный пароль. Заблокировано на {_LOCKOUT_SEC} сек."}), 429
+        return jsonify({"error": f"Неверный пароль. Осталось попыток: {left}"}), 403
+
+    _record_success(ip)
 
     if not _OPENAI_KEY and not _GEMINI_KEY and not _FAL_KEY:
         return jsonify({"error": "No API keys configured (need GEMINI_API_KEY, OPENAI_API_KEY or FAL_KEY)"}), 500
@@ -1332,6 +1839,46 @@ def api_generate():
     return jsonify({"job_id": job_id})
 
 
+@app.route("/api/regen-video", methods=["POST"])
+def api_regen_video():
+    """Re-generate video only with a different provider (reuses existing image)."""
+    ip = request.headers.get("X-Forwarded-For", request.remote_addr) or "unknown"
+    ip = ip.split(",")[0].strip()
+
+    allowed, reason = _check_login(ip)
+    if not allowed:
+        return jsonify({"error": reason}), 429
+
+    password = request.form.get("password", "").strip()
+    if password != _APP_PASSWORD:
+        left = _record_fail(ip)
+        if left <= 0:
+            return jsonify({"error": f"Заблокировано на {_LOCKOUT_SEC} сек."}), 429
+        return jsonify({"error": f"Неверный пароль. Осталось: {left}"}), 403
+
+    _record_success(ip)
+
+    image = request.form.get("image", "").strip()
+    vid_prompt = request.form.get("vid_prompt", "").strip()
+    provider = request.form.get("provider", "").strip()
+
+    if not image or not vid_prompt or not provider:
+        return jsonify({"error": "image, vid_prompt, provider обязательны"}), 400
+
+    img_name = os.path.basename(image)
+    img_path = os.path.join(_OUTPUT_DIR, img_name)
+    if not os.path.isfile(img_path):
+        return jsonify({"error": "Картинка не найдена"}), 404
+
+    job_id = uuid.uuid4().hex[:12]
+    _jobs[job_id] = {"status": "running", "queue": queue.Queue()}
+
+    t = threading.Thread(target=_run_regen_job, args=(job_id, img_path, vid_prompt, provider), daemon=True)
+    t.start()
+
+    return jsonify({"job_id": job_id})
+
+
 @app.route("/api/stream/<job_id>")
 def api_stream(job_id):
     job = _jobs.get(job_id)
@@ -1340,12 +1887,14 @@ def api_stream(job_id):
 
     def generate():
         q: queue.Queue = job["queue"]
-        while True:
+        start = time.time()
+        while time.time() - start < 600:  # 10 min max total
             try:
-                event = q.get(timeout=120)
+                event = q.get(timeout=30)
             except queue.Empty:
-                yield "data: {\"msg\": \"timeout\"}\n\n"
-                break
+                # Send SSE comment as keepalive (ignored by EventSource, keeps connection alive)
+                yield ": keepalive\n\n"
+                continue
             if event is None:
                 break
             yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n"
