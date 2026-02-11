@@ -707,7 +707,7 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
 # ── Hedra (new API at api.hedra.com — official starter format) ──
 
 _HEDRA_API = "https://api.hedra.com/web-app/public"
-_HEDRA_VIDEO_MODEL = "d1dd37a3-e39a-4854-a298-6510289f9cf2"  # official default
+_HEDRA_VIDEO_MODEL = os.environ.get("HEDRA_VIDEO_MODEL", "fb657777-6b02-478d-87a9-e02e8c53748c")  # Veo 3 I2V
 
 
 def _hedra_request(method: str, path: str, body: Optional[dict] = None, timeout: int = 60) -> dict:
