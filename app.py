@@ -782,6 +782,7 @@ def generate_hedra_video(image_path: str, text: str) -> str:
             "text_prompt": text[:2000],
             "resolution": "720p",
             "aspect_ratio": "16:9",
+            "duration_ms": 8000,
         },
         "batch_size": 1,
     }
