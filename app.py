@@ -704,11 +704,20 @@ def generate_kling_video(image_path: str, prompt: str, duration_sec: int = 10) -
     raise RuntimeError("Kling: таймаут (3 мин)")
 
 
-# ── Hedra (fallback — animated portrait with TTS) ──
+# ── Hedra (new API at api.hedra.com) ──
 
-def _hedra_json(url: str, method: str = "GET", headers: Optional[dict] = None,
-                body: Optional[bytes] = None, timeout: int = 60) -> dict:
-    req = urllib.request.Request(url, method=method, headers=headers or {}, data=body)
+_HEDRA_API = "https://api.hedra.com/web-app/public"
+# Most-used video model from user's history
+_HEDRA_VIDEO_MODEL = "d5af0ed3-c505-4495-802b-efb3e8ea741c"
+
+
+def _hedra_request(method: str, path: str, body: Optional[dict] = None, timeout: int = 60) -> dict:
+    """Make authenticated request to new Hedra API."""
+    url = f"{_HEDRA_API}{path}"
+    data = json.dumps(body).encode("utf-8") if body else None
+    req = urllib.request.Request(url, data=data, method=method)
+    req.add_header("X-API-Key", _HEDRA_KEY)
+    req.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(req, timeout=timeout) as resp:
             return json.loads(resp.read().decode("utf-8"))
@@ -717,76 +726,92 @@ def _hedra_json(url: str, method: str = "GET", headers: Optional[dict] = None,
         raise RuntimeError(f"Hedra HTTP {e.code}: {err}") from e
 
 
-def generate_hedra_video(image_path: str, text: str) -> str:
-    """Animate image as talking portrait via Hedra + TTS."""
-    if not _HEDRA_KEY:
-        raise RuntimeError("HEDRA_API_KEY not configured")
-
-    # 1. Upload image as portrait
-    boundary = f"----HedraUp{int(time.time())}"
-    fname = os.path.basename(image_path)
-    ct = "image/jpeg" if fname.endswith(".jpg") else "image/png"
+def _hedra_upload_image(image_path: str) -> str:
+    """Upload image to Hedra and return the asset URL."""
     with open(image_path, "rb") as f:
         img_bytes = f.read()
+    mime = detect_mime(img_bytes)
+
+    # Upload via multipart to assets endpoint
+    boundary = f"----HedraUp{int(time.time())}"
+    fname = os.path.basename(image_path)
     parts = [
         f"--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; "
-        f"filename=\"{fname}\"\r\nContent-Type: {ct}\r\n\r\n".encode(),
+        f"filename=\"{fname}\"\r\nContent-Type: {mime}\r\n\r\n".encode(),
         img_bytes,
         f"\r\n--{boundary}--\r\n".encode(),
     ]
     body = b"".join(parts)
-    upload_resp = _hedra_json(
-        f"{_HEDRA_BASE}/v1/portrait?aspect_ratio=16:9",
-        method="POST",
-        headers={
-            "X-API-KEY": _HEDRA_KEY,
-            "Content-Type": f"multipart/form-data; boundary={boundary}",
-        },
-        body=body,
-    )
-    portrait_url = upload_resp.get("url")
-    if not portrait_url:
-        raise RuntimeError(f"Hedra upload failed: {upload_resp}")
+    url = f"{_HEDRA_API}/assets"
+    req = urllib.request.Request(url, data=body, method="POST")
+    req.add_header("X-API-Key", _HEDRA_KEY)
+    req.add_header("Content-Type", f"multipart/form-data; boundary={boundary}")
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            result = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8")[:300] if e.fp else ""
+        raise RuntimeError(f"Hedra upload HTTP {e.code}: {err}") from e
 
-    # 2. Create character video with TTS
-    # Keep text short for natural speech (max ~200 chars)
-    short_text = text[:200].rsplit(" ", 1)[0] if len(text) > 200 else text
+    asset_id = result.get("id") or result.get("asset_id")
+    if not asset_id:
+        raise RuntimeError(f"Hedra upload: no asset_id: {result}")
+    return asset_id
+
+
+def generate_hedra_video(image_path: str, text: str) -> str:
+    """Generate video via Hedra new API (image-to-video)."""
+    if not _HEDRA_KEY:
+        raise RuntimeError("HEDRA_API_KEY not configured")
+
+    # Upload keyframe image
+    print(f"[hedra] Uploading keyframe: {image_path}", flush=True)
+    try:
+        asset_id = _hedra_upload_image(image_path)
+        print(f"[hedra] Keyframe asset: {asset_id}", flush=True)
+    except Exception:
+        asset_id = None
+
+    # Create video generation
     payload = {
-        "audioSource": "tts",
-        "text": short_text,
-        "avatarImage": portrait_url,
-        "aspectRatio": "16:9",
-    }
-    gen_resp = _hedra_json(
-        f"{_HEDRA_BASE}/v1/characters",
-        method="POST",
-        headers={
-            "X-API-KEY": _HEDRA_KEY,
-            "Content-Type": "application/json",
+        "type": "video",
+        "ai_model_id": _HEDRA_VIDEO_MODEL,
+        "generated_video_inputs": {
+            "text_prompt": text[:2000],
         },
-        body=json.dumps(payload).encode("utf-8"),
-    )
-    job_id = gen_resp.get("jobId") or gen_resp.get("project_id") or gen_resp.get("id")
-    if not job_id:
-        raise RuntimeError(f"Hedra generate failed: {gen_resp}")
+        "batch_size": 1,
+    }
+    if asset_id:
+        payload["start_keyframe_id"] = asset_id
 
-    # 3. Poll for completion (max 3 min)
-    deadline = time.time() + 180
+    print(f"[hedra] Starting video generation...", flush=True)
+    gen_resp = _hedra_request("POST", "/generations", body=payload, timeout=60)
+
+    gen_id = gen_resp.get("id")
+    if not gen_id:
+        raise RuntimeError(f"Hedra: no generation id: {gen_resp}")
+
+    # Poll for completion (max 5 min)
+    deadline = time.time() + 300
     while time.time() < deadline:
-        time.sleep(8)
-        status = _hedra_json(
-            f"{_HEDRA_BASE}/v1/projects/{job_id}",
-            headers={"X-API-KEY": _HEDRA_KEY},
-        )
-        state = status.get("status") or status.get("stage") or "unknown"
-        if state in ("Completed", "completed", "done", "success"):
-            video_url = status.get("videoUrl") or status.get("video_url") or status.get("url")
+        time.sleep(10)
+        status = _hedra_request("GET", f"/generations/{gen_id}")
+        state = status.get("status", "")
+
+        if state == "complete":
+            asset = status.get("asset", {})
+            video_url = asset.get("url") or asset.get("asset", {}).get("url", "")
             if not video_url:
-                raise RuntimeError("Hedra: completed but no video URL")
-            # Download
+                # Try batch_results
+                batch = status.get("batch_results", [])
+                if batch:
+                    video_url = batch[0].get("asset", {}).get("url", "")
+            if not video_url:
+                raise RuntimeError(f"Hedra: complete but no video URL: {status}")
+
             with urllib.request.urlopen(video_url, timeout=120) as resp:
                 vbytes = resp.read()
-            fpath = os.path.join(_OUTPUT_DIR, f"hedra_{job_id}.mp4")
+            fpath = os.path.join(_OUTPUT_DIR, f"hedra_{gen_id[:12]}.mp4")
             fd, tmp = tempfile.mkstemp(dir=_OUTPUT_DIR, suffix=".mp4")
             try:
                 with os.fdopen(fd, "wb") as f:
@@ -799,9 +824,13 @@ def generate_hedra_video(image_path: str, text: str) -> str:
                     pass
                 raise
             return fpath
-        if state in ("Failed", "failed", "error"):
-            raise RuntimeError(f"Hedra failed: {status.get('errorMessage') or status}")
-    raise RuntimeError("Hedra: таймаут (3 мин)")
+
+        if state == "error":
+            raise RuntimeError(f"Hedra failed: {status.get('error', status)}")
+
+        print(f"[hedra] Status: {state}, progress: {status.get('progress', '?')}", flush=True)
+
+    raise RuntimeError("Hedra: таймаут (5 мин)")
 
 
 # ── Veo 3.1 via Google Gemini API (direct, no FAL.ai) ──
@@ -831,6 +860,7 @@ def generate_veo3_video(image_path: str, prompt: str) -> str:
             "sampleCount": 1,
             "aspectRatio": "16:9",
             "durationSeconds": 8,
+            "resolution": "1080p",
         },
     }
     body = json.dumps(payload).encode("utf-8")
@@ -981,23 +1011,32 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
         img_name = os.path.basename(img_path)
         emit(f"Картинка готова ({img_source})!", step="dalle_done", image=f"/output/{img_name}")
 
-        # 3. Resize
-        video_img = resize_for_video(img_path, 1280, 720)
+        # 3. Resize for video (1080p)
+        video_img = resize_for_video(img_path, 1920, 1080)
 
-        # 4. Video — sequential: Veo 3 → Sora (no parallel to save money)
-        emit("Генерирую видео (Veo 3)...", step="video")
+        # 4. Video — sequential: Veo 3 → Hedra → Sora → Kling
+        emit("Генерирую видео (Veo 3, 1080p)...", step="video")
         video_path = None
         video_provider = ""
         video_errors = []
 
-        # Try Veo 3 (Gemini API)
+        # Try Veo 3 (Gemini API, free in preview)
         if _GEMINI_KEY:
             try:
                 video_path = generate_veo3_video(video_img, vid_prompt)
                 video_provider = "Veo 3"
             except Exception as veo_err:
                 video_errors.append(f"Veo 3: {str(veo_err)[:120]}")
-                emit(f"Veo 3: {str(veo_err)[:100]}. Пробую Sora...", step="video_error")
+                emit(f"Veo 3: {str(veo_err)[:100]}. Пробую Hedra...", step="video_error")
+        # Fallback: Hedra (user has credits)
+        if not video_path and _HEDRA_KEY:
+            try:
+                emit("Генерирую видео (Hedra)...", step="video")
+                video_path = generate_hedra_video(video_img, vid_prompt)
+                video_provider = "Hedra"
+            except Exception as hedra_err:
+                video_errors.append(f"Hedra: {str(hedra_err)[:120]}")
+                emit(f"Hedra: {str(hedra_err)[:100]}. Пробую Sora...", step="video_error")
         # Fallback: Sora (costs ~$1)
         if not video_path and _OPENAI_KEY:
             try:
