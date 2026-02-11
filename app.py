@@ -79,56 +79,111 @@ def _openai_headers() -> dict[str, str]:
     }
 
 
-# ── GPT creative prompts ──
+# ── Gemini creative prompts (FREE tier) ──
+
+_BRIEF_SYSTEM = (
+    "Ты — креативный директор премиального рекламного агентства и культуролог. "
+    "Клиент даёт короткую идею, а ты ГЛУБОКО раскрываешь тему и создаёшь ДВА промпта.\n\n"
+    "ТВОЯ ГЛАВНАЯ ЗАДАЧА — обогатить идею клиента контекстом:\n"
+    "— Если упомянуто МЕСТО (город, страна, регион) — добавь культуру, архитектуру, "
+    "  национальные символы, природу, традиции, историю этого места.\n"
+    "— Если упомянут ПРОДУКТ — покажи его не просто как вещь, а в контексте: "
+    "  люди, эмоции, стиль жизни, история бренда, среда использования.\n"
+    "— Если упомянута ТЕМА (спорт, музыка, еда) — раскрой атмосферу, субкультуру, "
+    "  легенды, героев, характерные детали.\n"
+    "— Всегда добавляй ЛЮДЕЙ, АКТИВНОСТЬ, ЭМОЦИИ — не просто пейзаж или предмет.\n\n"
+    "Примеры обогащения:\n"
+    "  «горы Осетии» → горные аулы, сторожевые башни, осетинские пироги на столе, "
+    "  старейшина с кинжалом, туман над ущельем, всадники, нартский эпос\n"
+    "  «кофейня» → бариста с латте-артом, утренний свет через витраж, пар над чашкой, "
+    "  люди за ноутбуками, аромат жареных зёрен, винтажная кофемолка\n"
+    "  «фитнес» → капли пота в слоу-мо, мощные мышцы, утренняя пробежка по набережной, "
+    "  дыхание на морозе, момент победы, зеркала зала\n\n"
+    "ПРОМПТ 1 — КАРТИНКА (для генерации изображения):\n"
+    "  Ключевой кадр. Премиальная эстетика (Mercedes, Apple, Nike). "
+    "  Композиция, цвета, свет, текстуры, настроение. "
+    "  Обязательно с людьми/активностью, не просто пейзаж. "
+    "  Если уместно — текст/слоган. На АНГЛИЙСКОМ. 1000–1500 символов — "
+    "  чем подробнее описание, тем лучше качество.\n\n"
+    "ПРОМПТ 2 — ВИДЕО (для 8 сек кинематографичный рекламный ролик):\n"
+    "  ВАЖНО: это САМЫЙ ГЛАВНЫЙ промпт, от него зависит качество видео!\n"
+    "  Пиши МАКСИМАЛЬНО ПОДРОБНО, 1500–2500 символов.\n"
+    "  Описывай КАЖДУЮ СЕКУНДУ ролика как режиссёр:\n"
+    "  — Секунды 0-2: что видим, какой план, движение камеры\n"
+    "  — Секунды 2-4: смена плана, новое действие\n"
+    "  — Секунды 4-6: кульминация, максимум динамики\n"
+    "  — Секунды 6-8: финал, слоган, эмоция\n"
+    "  Обязательно включи:\n"
+    "  — Движение камеры (наезд, облёт, панорама, слоу-мо, дрон, crane shot)\n"
+    "  — Активность людей (жесты, движения, эмоции на лицах)\n"
+    "  — Природу/среду (частицы, блики, дым, вода, ветер, свет)\n"
+    "  — Смену планов (крупный → средний → общий → деталь)\n"
+    "  — Кинематографичный свет (golden hour, контровой, неон, свечи)\n"
+    "  — Цветовую палитру и grade (тёплые тона, холодный blue grade, vintage)\n"
+    "  На АНГЛИЙСКОМ.\n\n"
+    "ФОРМАТ ОТВЕТА (строго):\n"
+    "КАРТИНКА: [промпт]\n"
+    "ВИДЕО: [промпт]"
+)
+
+
+def _parse_brief(text: str) -> tuple[str, str]:
+    """Parse КАРТИНКА/ВИДЕО from LLM response."""
+    img_prompt = text
+    vid_prompt = text
+    if "КАРТИНКА:" in text and "ВИДЕО:" in text:
+        parts = text.split("ВИДЕО:")
+        img_prompt = parts[0].replace("КАРТИНКА:", "").strip()
+        vid_prompt = parts[1].strip()
+    return img_prompt, vid_prompt
+
+
+def gemini_creative_prompts(idea: str, ref_images: list[tuple[bytes, str]] | None = None) -> tuple[str, str]:
+    """Generate creative brief via Gemini Flash (FREE tier)."""
+    if not _GEMINI_KEY:
+        raise RuntimeError("GEMINI_API_KEY not configured")
+    base_url = _GEMINI_BASE or "https://generativelanguage.googleapis.com"
+
+    # Build parts: system instruction + ref images + idea
+    parts = []
+    if ref_images:
+        for img_bytes, mime in ref_images[:3]:
+            b64 = base64.b64encode(img_bytes).decode()
+            parts.append({"inlineData": {"mimeType": mime, "data": b64}})
+    parts.append({"text": f"Идея клиента: {idea}"})
+
+    payload = {
+        "system_instruction": {"parts": [{"text": _BRIEF_SYSTEM}]},
+        "contents": [{"parts": parts}],
+        "generationConfig": {"temperature": 0.7, "maxOutputTokens": 3000},
+    }
+    data = json.dumps(payload).encode("utf-8")
+    url = f"{base_url}/v1beta/models/gemini-2.0-flash:generateContent"
+    req = urllib.request.Request(url, data=data, method="POST")
+    req.add_header("x-goog-api-key", _GEMINI_KEY)
+    req.add_header("Content-Type", "application/json")
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as e:
+        err = e.read().decode("utf-8")[:300] if e.fp else ""
+        raise RuntimeError(f"Gemini brief HTTP {e.code}: {err}") from e
+
+    candidates = body.get("candidates", [])
+    if not candidates:
+        raise RuntimeError("Gemini brief: no candidates")
+    text = candidates[0].get("content", {}).get("parts", [{}])[0].get("text", "")
+    if not text:
+        raise RuntimeError("Gemini brief: empty response")
+
+    return _parse_brief(text)
+
+
+# ── GPT creative prompts (fallback) ──
 
 def gpt_creative_prompts(idea: str, ref_images: list[tuple[bytes, str]] | None = None) -> tuple[str, str]:
-    system_msg = (
-        "Ты — креативный директор премиального рекламного агентства и культуролог. "
-        "Клиент даёт короткую идею, а ты ГЛУБОКО раскрываешь тему и создаёшь ДВА промпта.\n\n"
-        "ТВОЯ ГЛАВНАЯ ЗАДАЧА — обогатить идею клиента контекстом:\n"
-        "— Если упомянуто МЕСТО (город, страна, регион) — добавь культуру, архитектуру, "
-        "  национальные символы, природу, традиции, историю этого места.\n"
-        "— Если упомянут ПРОДУКТ — покажи его не просто как вещь, а в контексте: "
-        "  люди, эмоции, стиль жизни, история бренда, среда использования.\n"
-        "— Если упомянута ТЕМА (спорт, музыка, еда) — раскрой атмосферу, субкультуру, "
-        "  легенды, героев, характерные детали.\n"
-        "— Всегда добавляй ЛЮДЕЙ, АКТИВНОСТЬ, ЭМОЦИИ — не просто пейзаж или предмет.\n\n"
-        "Примеры обогащения:\n"
-        "  «горы Осетии» → горные аулы, сторожевые башни, осетинские пироги на столе, "
-        "  старейшина с кинжалом, туман над ущельем, всадники, нартский эпос\n"
-        "  «кофейня» → бариста с латте-артом, утренний свет через витраж, пар над чашкой, "
-        "  люди за ноутбуками, аромат жареных зёрен, винтажная кофемолка\n"
-        "  «фитнес» → капли пота в слоу-мо, мощные мышцы, утренняя пробежка по набережной, "
-        "  дыхание на морозе, момент победы, зеркала зала\n\n"
-        "ПРОМПТ 1 — КАРТИНКА (для DALL-E 3):\n"
-        "  Ключевой кадр. Премиальная эстетика (Mercedes, Apple, Nike). "
-        "  Композиция, цвета, свет, текстуры, настроение. "
-        "  Обязательно с людьми/активностью, не просто пейзаж. "
-        "  Если уместно — текст/слоган. На РУССКОМ. 1000–1500 символов — "
-        "  чем подробнее описание, тем лучше качество.\n\n"
-        "ПРОМПТ 2 — ВИДЕО (для Sora, 8 сек кинематографичный рекламный ролик):\n"
-        "  ВАЖНО: это САМЫЙ ГЛАВНЫЙ промпт, от него зависит качество видео!\n"
-        "  Пиши МАКСИМАЛЬНО ПОДРОБНО, 1500–2500 символов.\n"
-        "  Описывай КАЖДУЮ СЕКУНДУ ролика как режиссёр:\n"
-        "  — Секунды 0-2: что видим, какой план, движение камеры\n"
-        "  — Секунды 2-4: смена плана, новое действие\n"
-        "  — Секунды 4-6: кульминация, максимум динамики\n"
-        "  — Секунды 6-8: финал, слоган, эмоция\n"
-        "  Обязательно включи:\n"
-        "  — Движение камеры (наезд, облёт, панорама, слоу-мо, дрон, crane shot)\n"
-        "  — Активность людей (жесты, движения, эмоции на лицах)\n"
-        "  — Природу/среду (частицы, блики, дым, вода, ветер, свет)\n"
-        "  — Смену планов (крупный → средний → общий → деталь)\n"
-        "  — Кинематографичный свет (golden hour, контровой, неон, свечи)\n"
-        "  — Текст/слоган (как появляется, шрифт, анимация)\n"
-        "  — Звуковую атмосферу (хотя Sora без звука, описание помогает настроению)\n"
-        "  — Цветовую палитру и grade (тёплые тона, холодный blue grade, vintage)\n"
-        "  На РУССКОМ.\n\n"
-        "ФОРМАТ ОТВЕТА (строго):\n"
-        "КАРТИНКА: [промпт]\n"
-        "ВИДЕО: [промпт]"
-    )
-
+    """Generate creative brief via OpenAI GPT (fallback, costs money)."""
     user_parts: list = []
     if ref_images:
         for img_bytes, mime in ref_images[:3]:
@@ -142,7 +197,7 @@ def gpt_creative_prompts(idea: str, ref_images: list[tuple[bytes, str]] | None =
     payload = {
         "model": "gpt-4o-mini",
         "messages": [
-            {"role": "system", "content": system_msg},
+            {"role": "system", "content": _BRIEF_SYSTEM},
             {"role": "user", "content": user_content},
         ],
         "max_tokens": 2500,
@@ -157,18 +212,9 @@ def gpt_creative_prompts(idea: str, ref_images: list[tuple[bytes, str]] | None =
             body = json.loads(resp.read().decode())
     except urllib.error.HTTPError as e:
         err = e.read().decode()[:500] if e.fp else ""
-        print(f"[GPT] HTTP {e.code}: {err}", flush=True)
         raise RuntimeError(f"GPT HTTP {e.code}: {err[:200]}") from e
     text = body["choices"][0]["message"]["content"].strip()
-
-    img_prompt = text
-    vid_prompt = text
-    if "КАРТИНКА:" in text and "ВИДЕО:" in text:
-        parts = text.split("ВИДЕО:")
-        img_prompt = parts[0].replace("КАРТИНКА:", "").strip()
-        vid_prompt = parts[1].strip()
-
-    return img_prompt, vid_prompt
+    return _parse_brief(text)
 
 
 def yandex_gpt_creative_prompts(idea: str) -> tuple[str, str]:
@@ -865,13 +911,20 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
         q.put(event)
 
     try:
-        # 1. Creative brief (GPT → YandexGPT → template fallback)
+        # 1. Creative brief (Gemini FREE → GPT → YandexGPT → template)
         img_prompt = vid_prompt = ""
         brief_source = ""
         emit("Создаю креативный бриф...", step="gpt")
 
-        # Try OpenAI GPT
-        if _OPENAI_KEY:
+        # Try Gemini Flash (FREE)
+        if _GEMINI_KEY:
+            try:
+                img_prompt, vid_prompt = gemini_creative_prompts(idea, ref_images if ref_images else None)
+                brief_source = "Gemini"
+            except Exception as gem_err:
+                emit(f"Gemini бриф: {str(gem_err)[:100]}. Пробую GPT...", step="gpt_fallback")
+        # Try OpenAI GPT (costs money)
+        if not img_prompt and _OPENAI_KEY:
             try:
                 img_prompt, vid_prompt = gpt_creative_prompts(idea, ref_images if ref_images else None)
                 brief_source = "GPT"
@@ -891,26 +944,26 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
 
         emit(f"Бриф готов ({brief_source})", step="gpt_done", img_prompt=img_prompt, vid_prompt=vid_prompt)
 
-        # 2. Image (DALL-E → Flux → template)
+        # 2. Image (Gemini FREE → DALL-E → Flux)
         img_path = None
         img_source = ""
 
-        # Try DALL-E
-        if _OPENAI_KEY:
-            try:
-                emit("Генерирую картинку (DALL-E 3 HD)...", step="dalle")
-                img_path = generate_dalle(img_prompt)
-                img_source = "DALL-E"
-            except Exception as dalle_err:
-                emit(f"DALL-E: {str(dalle_err)[:100]}. Пробую Gemini...", step="dalle_fallback")
-        # Try Gemini
-        if not img_path and _GEMINI_KEY and _GEMINI_BASE:
+        # Try Gemini (FREE)
+        if _GEMINI_KEY:
             try:
                 emit("Генерирую картинку (Gemini)...", step="dalle")
                 img_path = generate_gemini_image(img_prompt)
                 img_source = "Gemini"
             except Exception as gemini_err:
-                emit(f"Gemini: {str(gemini_err)[:100]}. Пробую Flux...", step="dalle_fallback")
+                emit(f"Gemini: {str(gemini_err)[:100]}. Пробую DALL-E...", step="dalle_fallback")
+        # Try DALL-E (costs $0.12)
+        if not img_path and _OPENAI_KEY:
+            try:
+                emit("Генерирую картинку (DALL-E 3 HD)...", step="dalle")
+                img_path = generate_dalle(img_prompt)
+                img_source = "DALL-E"
+            except Exception as dalle_err:
+                emit(f"DALL-E: {str(dalle_err)[:100]}. Пробую Flux...", step="dalle_fallback")
         # Try fal.ai Flux
         if not img_path and _FAL_KEY:
             try:
@@ -928,77 +981,56 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
         # 3. Resize
         video_img = resize_for_video(img_path, 1280, 720)
 
-        # 4. Video — available providers in parallel for comparison
-        providers_list = []
-        if _KLING_ACCESS and _KLING_SECRET:
-            providers_list.append("Kling")
-        if _HEDRA_KEY:
-            providers_list.append("Hedra")
+        # 4. Video — sequential: Veo 3 → Sora (no parallel to save money)
+        emit("Генерирую видео (Veo 3)...", step="video")
+        video_path = None
+        video_provider = ""
+        video_errors = []
+
+        # Try Veo 3 (Gemini API)
         if _GEMINI_KEY:
-            providers_list.append("Veo 3")
-        if _OPENAI_KEY:
-            providers_list.append("Sora")
-        emit(f"Запускаю видео ({' + '.join(providers_list)} параллельно)...", step="video")
-
-        results: dict[str, dict] = {}  # provider → {"path": ..., "error": ...}
-        lock = threading.Lock()
-
-        def run_provider(name: str, fn, args):
             try:
-                path = fn(*args)
-                with lock:
-                    results[name] = {"path": path}
-                emit(f"{name}: готово!", step="video_partial")
-            except Exception as e:
-                with lock:
-                    results[name] = {"error": str(e)}
-                emit(f"{name}: {str(e)[:120]}", step="video_error")
+                video_path = generate_veo3_video(video_img, vid_prompt)
+                video_provider = "Veo 3"
+            except Exception as veo_err:
+                video_errors.append(f"Veo 3: {str(veo_err)[:120]}")
+                emit(f"Veo 3: {str(veo_err)[:100]}. Пробую Sora...", step="video_error")
+        # Fallback: Sora (costs ~$1)
+        if not video_path and _OPENAI_KEY:
+            try:
+                emit("Генерирую видео (Sora)...", step="video")
+                video_path = generate_sora_video(video_img, vid_prompt, 8)
+                video_provider = "Sora"
+            except Exception as sora_err:
+                video_errors.append(f"Sora: {str(sora_err)[:120]}")
+                emit(f"Sora: {str(sora_err)[:100]}", step="video_error")
+        # Fallback: Kling
+        if not video_path and _KLING_ACCESS and _KLING_SECRET:
+            try:
+                emit("Генерирую видео (Kling)...", step="video")
+                video_path = generate_kling_video(video_img, vid_prompt, 10)
+                video_provider = "Kling"
+            except Exception as kling_err:
+                video_errors.append(f"Kling: {str(kling_err)[:120]}")
+                emit(f"Kling: {str(kling_err)[:100]}", step="video_error")
 
-        threads = []
-        if _KLING_ACCESS and _KLING_SECRET:
-            t = threading.Thread(target=run_provider, args=("Kling", generate_kling_video, (video_img, vid_prompt, 10)))
-            threads.append(t)
-        if _HEDRA_KEY:
-            t = threading.Thread(target=run_provider, args=("Hedra", generate_hedra_video, (video_img, idea)))
-            threads.append(t)
-        if _GEMINI_KEY:
-            t = threading.Thread(target=run_provider, args=("Veo 3", generate_veo3_video, (video_img, vid_prompt)))
-            threads.append(t)
-        if _OPENAI_KEY:
-            t = threading.Thread(target=run_provider, args=("Sora", generate_sora_video, (video_img, vid_prompt, 8)))
-            threads.append(t)
+        if not video_path:
+            raise RuntimeError("Ни одно видео не удалось:\n" + "\n".join(video_errors))
 
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join(timeout=360)  # 6 min max per thread
+        vid_name = os.path.basename(video_path)
+        videos = [{"provider": video_provider, "url": f"/output/{vid_name}"}]
 
-        # Collect successful videos
-        videos = []
-        errors = []
-        for name, res in results.items():
-            if "path" in res:
-                vid_name = os.path.basename(res["path"])
-                videos.append({"provider": name, "url": f"/output/{vid_name}"})
-            else:
-                errors.append(f"{name}: {res.get('error', 'unknown')}")
-
-        if not videos:
-            raise RuntimeError("Ни одно видео не удалось:\n" + "\n".join(errors))
-
-        # Send all videos for comparison
-        providers_str = ", ".join(v["provider"] for v in videos)
         emit(
-            f"Готово! Видео: {providers_str}",
+            f"Готово! Видео: {video_provider}",
             step="done",
             videos=videos,
-            video=videos[0]["url"],  # backward compat
-            video_provider=providers_str,
-            errors=errors if errors else None,
+            video=videos[0]["url"],
+            video_provider=video_provider,
+            errors=video_errors if video_errors else None,
         )
         job["status"] = "done"
 
-        # Save to shared history (first successful video as primary)
+        # Save to history
         _save_history_entry({
             "idea": idea,
             "img_prompt": img_prompt,
@@ -1006,7 +1038,7 @@ def _run_job(job_id: str, idea: str, ref_images: list[tuple[bytes, str]]):
             "image": f"/output/{img_name}",
             "video": videos[0]["url"],
             "videos": videos,
-            "provider": providers_str,
+            "provider": video_provider,
             "ts": int(time.time() * 1000),
         })
 
@@ -1031,8 +1063,8 @@ def serve_output(filename):
 
 @app.route("/api/generate", methods=["POST"])
 def api_generate():
-    if not _OPENAI_KEY and not _FAL_KEY:
-        return jsonify({"error": "No API keys configured (need OPENAI_API_KEY or FAL_KEY)"}), 500
+    if not _OPENAI_KEY and not _GEMINI_KEY and not _FAL_KEY:
+        return jsonify({"error": "No API keys configured (need GEMINI_API_KEY, OPENAI_API_KEY or FAL_KEY)"}), 500
 
     idea = request.form.get("idea", "").strip()
     if not idea:
